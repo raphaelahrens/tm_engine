@@ -8,3 +8,9 @@ edition = "2021"
 [dependencies]
 petgraph = "0.6"
 nom = "7.1"
+nom-span = "0.1"
+thiserror = "1.0"
+itertools = "0.12"
+fixedbitset ="0.4.2"
+clap = { version = "4.4.18", features = ["derive"] }
+eyre = "0.6.11"

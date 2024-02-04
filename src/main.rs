@@ -1,14 +1,44 @@
-use petgraph::dot::{Config, Dot};
-use petgraph::Graph;
+use std::fs::File;
+use std::io::Read;
+use std::path::{PathBuf, Path};
 
-fn main() {
-    let mut deps = Graph::<&str, &str>::new();
-    let pg = deps.add_node("petgraph");
-    let fb = deps.add_node("fixedbitset");
-    let qc = deps.add_node("quickcheck");
-    let rand = deps.add_node("rand");
-    let libc = deps.add_node("libc");
-    deps.extend_with_edges(&[(pg, fb), (pg, qc), (qc, rand), (rand, libc), (qc, libc)]);
+use clap::{Parser, Subcommand};
+use eyre::{Result, eyre};
 
-    println!("{:?}", Dot::with_config(&deps, &[Config::EdgeNoLabel]));
+use petgraph::dot::{Dot, Config};
+
+use tm_engine::parser::parse_model;
+use tm_engine::ModelCompiler;
+
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    model: PathBuf,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Check,
+}
+
+fn build_model(model: &Path, path: PathBuf) -> Result<()> {
+    let mut builder = ModelCompiler::new(vec![path]);
+
+    builder.compile_file(model)?;
+
+    let model = builder.build();
+    println!("{:?}", Dot::with_config(&model.graph, &[]));
+
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    
+    let parent_dir = args.model.parent().ok_or(eyre!("Could not find parent directory"))?;
+    build_model(&args.model, parent_dir.to_path_buf())?;
+    Ok(())
 }
