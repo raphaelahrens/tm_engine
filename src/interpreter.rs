@@ -64,7 +64,7 @@ impl From<&Decision> for bool {
 pub fn execute(query: &Query, element: &ValueTree) -> Result<Decision, ExecutionError> {
     let mut stack = Vec::with_capacity(256);
     let mut ops_iter = query.iter();
-    while let Some((ops, false_jump, true_jump)) = ops_iter.next() {
+    while let Some((ops, false_jump, _true_jump)) = ops_iter.next() {
         match ops {
             Operation::Bool(value) => {
                 stack.push(StackValue::Bool(*value));
@@ -75,7 +75,7 @@ pub fn execute(query: &Query, element: &ValueTree) -> Result<Decision, Execution
             Operation::Str(value) => {
                 stack.push(StackValue::Str(value));
             }
-            Operation::EnumValue(value) => {
+            Operation::EnumValue(_value) => {
                 todo!("");
             }
             Operation::Member { name: path, pos: p } => match element.get(path) {

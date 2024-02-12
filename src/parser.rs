@@ -153,7 +153,7 @@ fn set_jump(ops: &[Operation], false_jumps: &mut Vec<usize>, index: usize, argn:
 impl Query {
     pub fn new(ops: Box<[Operation]>) -> Self {
         let mut false_jumps = vec![0; ops.len()];
-        let mut true_jumps = vec![0; ops.len()];
+        let true_jumps = vec![0; ops.len()];
 
         for (i, op) in ops.iter().enumerate() {
             match op {
@@ -313,7 +313,7 @@ fn int<'i>(input: &mut Stream) -> PResult<Constant<'i>> {
 fn enum_value<'i>(input: &mut Stream<'i>) -> PResult<Constant<'i>> {
     sub_identifier::<1>
         .with_span()
-        .map(|(s, r)| Constant::EnumValue(s))
+        .map(|(s, _r)| Constant::EnumValue(s))
         .parse_next(input)
 }
 
@@ -815,7 +815,7 @@ mod test {
             name,
             super_type,
             members,
-            doc_str,
+            doc_str: _,
         } = &result[0]
         {
             assert_eq!(*name, "File");
@@ -848,7 +848,7 @@ mod test {
             name,
             super_type,
             members,
-            doc_str,
+            doc_str: _,
         } = &result[0]
         {
             assert_eq!(*name, "File");
@@ -878,7 +878,7 @@ mod test {
             name,
             super_type,
             members,
-            doc_str,
+            doc_str: _,
         } = &result[0]
         {
             assert_eq!(*name, "File");
@@ -901,7 +901,7 @@ mod test {
         if let Node::Enum {
             name,
             members,
-            doc_str,
+            doc_str: _,
         } = &result[0]
         {
             assert_eq!(*name, "Level");

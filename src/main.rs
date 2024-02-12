@@ -1,13 +1,13 @@
-use std::fs::File;
-use std::io::Read;
+
+
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use eyre::{eyre, Result};
 
-use petgraph::dot::{Config, Dot};
+use petgraph::dot::{Dot};
 
-use tm_engine::parser::parse_model;
+
 use tm_engine::ModelCompiler;
 
 #[derive(Parser)]

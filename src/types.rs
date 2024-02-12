@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
-use std::path::Iter;
+
 use std::rc::Rc;
 
 use thiserror::Error;
 
-use crate::{Str, Value, ValueTree};
+use crate::{Str, Value};
 
 #[derive(Debug, Clone)]
 struct TypeMember {
@@ -189,5 +189,5 @@ impl Display for Class {
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    
 }

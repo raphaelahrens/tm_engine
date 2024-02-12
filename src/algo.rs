@@ -250,8 +250,8 @@ mod test {
         let mut query = QueryGraphBuilder::new();
         let s = query.add(QElement::new(".server").unwrap());
         let c = query.add(QElement::new(".client").unwrap());
-        let result_login = query.connect(c, s, QFlow::new("true").unwrap());
-        let result_login = query.connect(s, c, QFlow::new("true").unwrap());
+        let _result_login = query.connect(c, s, QFlow::new("true").unwrap());
+        let _result_login = query.connect(s, c, QFlow::new("true").unwrap());
 
         let query = query.build();
 
@@ -267,17 +267,17 @@ mod test {
         let server = model.add(Element::new(obj()));
         let other = model.add(Element::new(obj()));
 
-        let request_login = model.connect(client, server, Flow::new(obj()));
-        let result_login = model.connect(client, server, Flow::new(obj()));
-        let result_login2 = model.connect(server, client, Flow::new(obj()));
+        let _request_login = model.connect(client, server, Flow::new(obj()));
+        let _result_login = model.connect(client, server, Flow::new(obj()));
+        let _result_login2 = model.connect(server, client, Flow::new(obj()));
         let model = model.build();
 
         let mut query = QueryGraphBuilder::new();
         let s = query.add(QElement::new("true").unwrap());
         let c = query.add(QElement::new("true").unwrap());
-        let o = query.add(QElement::new("true").unwrap());
-        let result_login = query.connect(c, s, QFlow::new("true").unwrap());
-        let result_login = query.connect(c, s, QFlow::new("true").unwrap());
+        let _o = query.add(QElement::new("true").unwrap());
+        let _result_login = query.connect(c, s, QFlow::new("true").unwrap());
+        let _result_login = query.connect(c, s, QFlow::new("true").unwrap());
 
         let query = query.build();
 

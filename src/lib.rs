@@ -362,14 +362,14 @@ impl ModelCompiler {
                     doc_str,
                 } => self.add_node_flow(from, to, datatype, members, doc_str)?,
                 Node::Sequence {
-                    name,
-                    flows,
-                    doc_str,
+                    name: _,
+                    flows: _,
+                    doc_str: _,
                 } => {}
                 Node::Module {
-                    name,
-                    members,
-                    doc_str,
+                    name: _,
+                    members: _,
+                    doc_str: _,
                 } => {
                     todo!();
                 }
@@ -632,7 +632,7 @@ mod test {
         let mut query = QueryGraphBuilder::new();
         let client = query.add(QElement::new(".client and true == .bool").unwrap());
         let server = query.add(QElement::new(".server").unwrap());
-        let request_login = query.connect(client, server, QFlow::new("true").unwrap());
+        let _request_login = query.connect(client, server, QFlow::new("true").unwrap());
 
         let query = query.build();
         assert_eq!(model.query(&query), 1);
