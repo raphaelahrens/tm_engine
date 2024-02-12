@@ -18,50 +18,55 @@
  * WHITESPACE = _{ " " | "\t" | "\n" }
 */
 
-use nom::{
-    branch::alt,
-    bytes::complete::tag,
-    character::complete::{
-        alpha1, alphanumeric0, alphanumeric1, char, hex_digit1, i64, multispace0, multispace1,
-        newline, not_line_ending, space0, space1,
-    },
-    combinator::{eof, into, map, map_res, opt, recognize, value},
-    error::{ParseError, VerboseError},
-    multi::{many0, many0_count, many1_count, separated_list0, separated_list1},
-    sequence::{delimited, pair, preceded, terminated, tuple},
-    Finish, IResult,
-};
 use std::fmt;
+use std::ops::RangeInclusive;
 
+use winnow::{
+    ascii::{
+        digit1, hex_digit1, line_ending, multispace0, multispace1, space0, space1, till_line_ending,
+    },
+    combinator::{
+        alt, cut_err, delimited, eof, opt, preceded, repeat, separated, terminated, trace, Repeat,
+    },
+    error::{ParserError, StrContext},
+    prelude::*,
+    seq,
+    token::{any, none_of, one_of, take_while},
+    Located,
+};
+
+const ALPHA: (RangeInclusive<char>, RangeInclusive<char>) = ('a'..='z', 'A'..='Z');
+const DIGIT: RangeInclusive<char> = '0'..='9';
 //pub type Span<'input> = LocatedSpan<&'input str>;
-pub type Span<'input> = &'input str;
+pub type Stream<'i> = Located<&'i str>;
 
 /// A combinator that takes a parser `inner` and produces a parser that also consumes both leading and
 /// trailing whitespace, returning the output of `inner`.
-fn ws<'input, F: 'input, O, E: ParseError<Span<'input>>>(
-    inner: F,
-) -> impl FnMut(Span<'input>) -> IResult<Span<'input>, O, E>
+
+fn ws<'i, F, O, E>(inner: F) -> impl Parser<Stream<'i>, O, E>
 where
-    F: Fn(Span<'input>) -> IResult<Span<'input>, O, E>,
+    E: ParserError<Stream<'i>>
+        + for<'a> winnow::error::AddContext<winnow::Located<&'a str>, winnow::error::StrContext>,
+    F: Parser<Stream<'i>, O, E>,
 {
-    delimited(space0, inner, space0)
+    delimited(
+        space0.context(StrContext::Label("leading space")),
+        inner.context(StrContext::Label("inner")),
+        space0.context(StrContext::Label("trailing space")),
+    )
 }
 
-fn multi_ws<'input, F: 'input, O, E: ParseError<Span<'input>>>(
-    inner: F,
-) -> impl FnMut(Span<'input>) -> IResult<Span<'input>, O, E>
+fn multi_ws<'i, F, O, E>(inner: F) -> impl Parser<Stream<'i>, O, E>
 where
-    F: Fn(Span<'input>) -> IResult<Span<'input>, O, E>,
+    E: ParserError<Stream<'i>>
+        + for<'a> winnow::error::AddContext<winnow::Located<&'a str>, winnow::error::StrContext>,
+    F: Parser<Stream<'i>, O, E>,
 {
-    delimited(multispace0, inner, multispace0)
-}
-
-fn ws_char<'input, E: ParseError<Span<'input>> + 'input>(
-    c: char,
-) -> impl FnMut(Span<'input>) -> IResult<Span<'input>, char, E>
-where
-{
-    multi_ws(char(c))
+    delimited(
+        multispace0.context(StrContext::Label("leading space")),
+        inner.context(StrContext::Label("inner")),
+        multispace0.context(StrContext::Label("trailing space")),
+    )
 }
 
 #[derive(Debug, PartialEq)]
@@ -69,6 +74,7 @@ pub enum Constant<'input> {
     Bool(bool),
     Str(&'input str),
     Int(i64),
+    EnumValue(&'input str),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -76,6 +82,7 @@ pub enum Operation {
     Bool(bool),
     Str(Box<str>),
     Int(i64),
+    EnumValue(Box<str>),
     Member { name: Box<str>, pos: usize },
     Not,
     Greater,
@@ -104,6 +111,7 @@ impl Operation {
             Self::Bool(true) => '1',
             Self::Str(_) => '"',
             Self::Int(_) => '#',
+            Self::EnumValue(_) => 'E',
             Self::Member { name, .. } => {
                 let mut iter = name.chars().skip(1);
                 match iter.next() {
@@ -121,6 +129,7 @@ impl From<Constant<'_>> for Operation {
             Constant::Bool(b) => Operation::Bool(b),
             Constant::Str(v) => Operation::Str(v.into()),
             Constant::Int(v) => Operation::Int(v),
+            Constant::EnumValue(v) => Operation::EnumValue(v.into()),
         }
     }
 }
@@ -227,118 +236,132 @@ impl<'query> Iterator for QueryIter<'query> {
         Some((op, *false_jump, *true_jump))
     }
 }
+fn bool<'i>(input: &mut Stream<'i>) -> PResult<Constant<'i>> {
+    let parse_true = "true".value(true);
 
-fn bool(input: Span) -> IResult<Span, Constant, VerboseError<Span>> {
+    // This is a parser that returns `false` if it sees the string "false", and
+    // an error otherwise
+    let parse_false = "false".value(false);
+
+    alt((parse_true, parse_false))
+        .map(|b| Constant::Bool(b))
+        .parse_next(input)
+}
+
+fn character<'i>(input: &mut Stream<'i>) -> PResult<char> {
+    let c = none_of('\"').parse_next(input)?;
+    if c == '\\' {
+        alt((any.verify_map(|c| {
+            Some(match c {
+                '"' | '\\' | '/' => c,
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                _ => return None,
+            })
+        }),))
+        .parse_next(input)
+    } else {
+        Ok(c)
+    }
+}
+
+fn string<'i>(input: &mut Stream<'i>) -> PResult<Constant<'i>> {
+    let chars: Repeat<_, _, _, (), _> = repeat(0.., character);
+    preceded(
+        '\"',
+        // `cut_err` transforms an `ErrMode::Backtrack(e)` to `ErrMode::Cut(e)`, signaling to
+        // combinators like  `alt` that they should not try other parsers. We were in the
+        // right branch (since we found the `"` character) but encountered an error when
+        // parsing the string
+        cut_err(terminated(chars.recognize(), '\"')),
+    )
+    // `context` lets you add a static string to errors to provide more information in the
+    // error chain (to indicate which parser had an error)
+    .map(|s| Constant::Str(s))
+    .parse_next(input)
+}
+
+fn identifier<'i>(input: &mut Stream<'i>) -> PResult<&'i str> {
+    (one_of(ALPHA), take_while(0.., (ALPHA, DIGIT, '_')))
+        .recognize()
+        .context(StrContext::Label("identifier"))
+        .parse_next(input)
+}
+
+fn sub_identifier<'i, const N: usize>(input: &mut Stream<'i>) -> PResult<&'i str> {
+    let prefix: Repeat<_, _, _, (), _> = repeat(N.., preceded(identifier, '.'));
+    preceded(prefix, identifier).recognize().parse_next(input)
+}
+
+fn int<'i>(input: &mut Stream) -> PResult<Constant<'i>> {
     alt((
-        map(tag("true"), |_| Constant::Bool(true)),
-        map(tag("false"), |_| Constant::Bool(false)),
-    ))(input)
+        preceded(
+            "0x",
+            hex_digit1.verify_map(|s: &str| i64::from_str_radix(&s, 16).ok()),
+        ),
+        (
+            opt('-'),
+            digit1.verify_map(|s: &str| i64::from_str_radix(&s, 10).ok()),
+        )
+            .map(|(sign, i)| if let Some(_) = sign { -i } else { i }),
+    ))
+    .map(Constant::Int)
+    .parse_next(input)
 }
 
-fn quote(input: Span) -> IResult<Span, char, VerboseError<Span>> {
-    char('"')(input)
+fn enum_value<'i>(input: &mut Stream<'i>) -> PResult<Constant<'i>> {
+    sub_identifier::<1>
+        .with_span()
+        .map(|(s, r)| Constant::EnumValue(s))
+        .parse_next(input)
 }
 
-fn string(input: Span) -> IResult<Span, Constant, VerboseError<Span>> {
-    //TODO this does not work with complex text (unicode)
-    map(delimited(quote, alphanumeric0, quote), |s| {
-        Constant::Str(&s)
-    })(input)
+fn value_constant<'i>(input: &mut Stream<'i>) -> PResult<Constant<'i>> {
+    alt((bool, int, string, enum_value)).parse_next(input)
 }
 
-fn sub_identifier(input: Span) -> IResult<Span, Span, VerboseError<Span>> {
-        recognize(preceded(
-            many0_count(preceded(identifier, char('.'))),
-            identifier,
-        ))(input)
+fn member<'i, const N: usize>(input: &mut Stream) -> PResult<Operation> {
+    repeat::<_, _, (), _, _>(1.., preceded('.', identifier))
+        .recognize()
+        .map(|s| Operation::Member {
+            name: (*s).into(),
+            pos: N,
+        })
+        .parse_next(input)
 }
 
-//fn atom(input: Span) -> IResult<Span, Constant, VerboseError<Span>> {
-//    map(
-//        sub_identifier,
-//        |s| Constant::Atom(&s),
-//    )(input)
-//}
-
-fn int(input: Span) -> IResult<Span, Constant, VerboseError<Span>> {
-    let hex_num = map_res(preceded(tag("0x"), hex_digit1), |s: Span| {
-        i64::from_str_radix(&s, 16)
-    });
-    let dec_num = map(tuple((opt(tag("-")), i64)), |(sign, num)| match sign {
-        None => num,
-        Some(_) => -num,
-    });
-    map(alt((hex_num, dec_num)), Constant::Int)(input)
-}
-
-fn value_constant(input: Span) -> IResult<Span, Constant, VerboseError<Span>> {
-    alt((bool, int, string))(input)
-}
-
-fn identifier(input: Span) -> IResult<Span, &str, VerboseError<Span>> {
-    map(
-        recognize(pair(alpha1, many0_count(alt((alphanumeric1, tag("_")))))),
-        |s: Span| s,
-    )(input)
-}
-
-fn member<const N: usize>(input: Span) -> IResult<Span, Operation, VerboseError<Span>> {
-    let attribute = preceded(char('.'), identifier);
-    map(recognize(many1_count(attribute)), |s| Operation::Member {
-        name: (*s).into(),
-        pos: N,
-    })(input)
-}
-
-fn equal(input: Span) -> IResult<Span, Operation, VerboseError<Span>> {
-    value(Operation::Equal, tag("=="))(input)
-}
-fn not_equal(input: Span) -> IResult<Span, Operation, VerboseError<Span>> {
-    value(Operation::NotEqual, tag("!="))(input)
-}
-fn greater(input: Span) -> IResult<Span, Operation, VerboseError<Span>> {
-    value(Operation::Greater, tag(">"))(input)
-}
-fn greater_eq(input: Span) -> IResult<Span, Operation, VerboseError<Span>> {
-    value(Operation::GreaterEq, tag(">="))(input)
-}
-fn lesser(input: Span) -> IResult<Span, Operation, VerboseError<Span>> {
-    value(Operation::Lesser, tag("<"))(input)
-}
-fn lesser_eq(input: Span) -> IResult<Span, Operation, VerboseError<Span>> {
-    value(Operation::LesserEq, tag("<="))(input)
-}
-
-fn comp_op(input: Span) -> IResult<Span, Operation, VerboseError<Span>> {
-    alt((equal, not_equal, greater_eq, lesser_eq, greater, lesser))(input)
-}
-
-fn term<const N: usize>(input: Span) -> IResult<Span, Operation, VerboseError<Span>> {
-    alt((member::<N>, into(value_constant)))(input)
-}
-
-fn not_expr<const N: usize>(input: Span) -> IResult<Span, Vec<Operation>, VerboseError<Span>> {
+fn comp_op<'i>(input: &mut Stream) -> PResult<Operation> {
     alt((
-        map(
-            preceded(tuple((tag("not"), space1)), not_expr::<0>),
-            |mut e| {
-                e.push(Operation::Not);
-                e
-            },
-        ),
-        map(term::<N>, |t| vec![t]),
-    ))(input)
+        "==".value(Operation::Equal),
+        "!=".value(Operation::NotEqual),
+        ">=".value(Operation::GreaterEq),
+        "<=".value(Operation::LesserEq),
+        ">".value(Operation::Greater),
+        "<".value(Operation::Lesser),
+    ))
+    .parse_next(input)
 }
 
-fn parents_expr(input: Span) -> IResult<Span, Vec<Operation>, VerboseError<Span>> {
-    map(
-        delimited(
-            tuple((tag("("), space0)),
-            logic_or,
-            tuple((space0, tag(")"))),
-        ),
-        |e| e,
-    )(input)
+fn term<'i, const N: usize>(input: &mut Stream) -> PResult<Operation> {
+    alt((member::<N>, value_constant.map(|c| c.into()))).parse_next(input)
+}
+
+fn not_expr<'i, const N: usize>(input: &mut Stream) -> PResult<Vec<Operation>> {
+    alt((
+        preceded(("not", space1), not_expr::<0>).map(|mut e| {
+            e.push(Operation::Not);
+            e
+        }),
+        term::<N>.map(|t| vec![t]),
+    ))
+    .parse_next(input)
+}
+
+fn parents_expr<'i>(input: &mut Stream) -> PResult<Vec<Operation>> {
+    delimited(('(', space0), logic_or, (space0, ')'))
+        .map(|e| e)
+        .parse_next(input)
 }
 
 fn collapse_tree<'a>(
@@ -351,41 +374,38 @@ fn collapse_tree<'a>(
     a
 }
 
-fn comp_expr(input: Span) -> IResult<Span, Vec<Operation>, VerboseError<Span>> {
+fn comp_expr<'i>(input: &mut Stream) -> PResult<Vec<Operation>> {
     alt((
-        map(
-            tuple((not_expr::<0>, space0, comp_op, space0, not_expr::<1>)),
-            |(a, _, op, _, b)| collapse_tree(a, b, op),
-        ),
+        (not_expr::<0>, space0, comp_op, space0, not_expr::<1>)
+            .map(|(a, _, op, _, b)| collapse_tree(a, b, op)),
         not_expr::<0>,
         parents_expr,
-    ))(input)
+    ))
+    .parse_next(input)
 }
 
-fn logic_and(input: Span) -> IResult<Span, Vec<Operation>, VerboseError<Span>> {
+fn logic_and<'i>(input: &mut Stream) -> PResult<Vec<Operation>> {
     alt((
-        map(
-            tuple((comp_expr, multispace1, tag("and"), multispace1, logic_and)),
-            |(a, _, _, _, b)| collapse_tree(a, b, Operation::And),
-        ),
-        map(comp_expr, |t| t),
-    ))(input)
+        (comp_expr, multispace1, "and", multispace1, logic_and)
+            .map(|(a, _, _, _, b)| collapse_tree(a, b, Operation::And)),
+        comp_expr,
+    ))
+    .parse_next(input)
 }
 
-fn logic_or(input: Span) -> IResult<Span, Vec<Operation>, VerboseError<Span>> {
+fn logic_or<'i>(input: &mut Stream) -> PResult<Vec<Operation>> {
     alt((
-        map(
-            tuple((logic_and, multispace1, tag("or"), multispace1, logic_or)),
-            |(a, _, _, _, b)| collapse_tree(a, b, Operation::Or),
-        ),
+        (logic_and, multispace1, "or", multispace1, logic_or)
+            .map(|(a, _, _, _, b)| collapse_tree(a, b, Operation::Or)),
         logic_and,
-    ))(input)
+    ))
+    .parse_next(input)
 }
 
-pub fn parse_query(input: &str) -> IResult<Span, Query, VerboseError<Span>> {
-    map(terminated(ws(logic_or), eof), |v| {
-        Query::new(v.into_boxed_slice())
-    })(input.into())
+pub fn parse_query<'i>(input: &str) -> PResult<Query> {
+    terminated(ws(logic_or), eof)
+        .map(|v| Query::new(v.into_boxed_slice()))
+        .parse_next(&mut Located::new(input))
 }
 
 #[derive(Debug, PartialEq)]
@@ -398,7 +418,7 @@ pub enum Node<'input> {
     },
     Enum {
         name: &'input str,
-        members: Vec<&'input str>,
+        members: Vec<EnumMember<'input>>,
         doc_str: Vec<&'input str>,
     },
     Module {
@@ -422,11 +442,11 @@ pub enum Node<'input> {
         members: Vec<ObjectMember<'input>>,
         doc_str: Vec<&'input str>,
     },
-    Sequence{
+    Sequence {
         name: Option<&'input str>,
         flows: Vec<Node<'input>>,
         doc_str: Vec<&'input str>,
-    }
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -451,6 +471,12 @@ pub struct ObjectMember<'input> {
 }
 
 #[derive(Debug, PartialEq)]
+pub struct EnumMember<'input> {
+    pub name: &'input str,
+    pub doc_str: Vec<&'input str>,
+}
+
+#[derive(Debug, PartialEq)]
 pub enum MemberValue<'input> {
     Object {
         datatype: &'input str,
@@ -459,318 +485,332 @@ pub enum MemberValue<'input> {
     Const(Constant<'input>),
 }
 
-fn block<'input, F: 'input, O, E: ParseError<Span<'input>> + 'input>(
-    inner: F,
-) -> impl FnMut(Span<'input>) -> IResult<Span<'input>, O, E>
+fn block<'i, F, O, E>(inner: F) -> impl Parser<Stream<'i>, O, E>
 where
-    F: FnMut(Span<'input>) -> IResult<Span<'input>, O, E>,
+    E: ParserError<Stream<'i>>
+        + for<'a> winnow::error::AddContext<winnow::Located<&'a str>, winnow::error::StrContext>,
+    F: Parser<Stream<'i>, O, E>,
 {
-    delimited(multi_ws(char('{')), inner, multi_ws(char('}')))
+    delimited(
+        multi_ws('{').context(StrContext::Label("{")),
+        inner,
+        multi_ws('}'),
+    )
 }
 
-pub fn comment_line<'input>(
-    input: Span<'input>,
-) -> IResult<Span<'input>, &'input str, VerboseError<Span>> {
-    let (input, _c) = ws(char('#'))(input)?;
-    let (rest, comment_str) = recognize(not_line_ending)(input)?;
-    Ok((rest, &comment_str))
+pub fn comment_line<'i>(input: &mut Stream<'i>) -> PResult<&'i str> {
+    preceded(ws('#'), till_line_ending).parse_next(input)
 }
 
-pub fn comment_block<'input>(
-    input: Span<'input>,
-) -> IResult<Span<'input>, Vec<&'input str>, VerboseError<Span>> {
-    preceded(multispace0, many0(terminated(comment_line, newline)))(input)
+pub fn comment_block<'i>(input: &mut Stream<'i>) -> PResult<Vec<&'i str>> {
+    preceded(
+        multispace0,
+        repeat(0.., terminated(comment_line, line_ending)),
+    )
+    .context(StrContext::Label("comment block"))
+    .parse_next(input)
 }
 
-fn assign<'input>(input: Span<'input>) -> IResult<Span<'input>, char, VerboseError<Span>> {
-    ws(char('='))(input)
+fn assign<'i>(input: &mut Stream<'i>) -> PResult<char> {
+    multi_ws('=').parse_next(input)
 }
 
-fn colon<'input>(input: Span<'input>) -> IResult<Span<'input>, char, VerboseError<Span>> {
-    ws(char(':'))(input)
+fn colon<'i>(input: &mut Stream<'i>) -> PResult<char> {
+    multi_ws(':').parse_next(input)
 }
 
-fn enum_member(input: Span) -> IResult<Span, &str, VerboseError<Span>> {
-    identifier(input)
+fn comma<'i>(input: &mut Stream<'i>) -> PResult<char> {
+    multi_ws(',')
+        .context(StrContext::Label("comma"))
+        .parse_next(input)
 }
 
-fn comma(input: Span) -> IResult<Span, char, VerboseError<Span>> {
-    ws_char(',')(input)
+fn enum_member<'i>(input: &mut Stream<'i>) -> PResult<EnumMember<'i>> {
+    seq! {
+        EnumMember{
+            doc_str:comment_block,
+            name:preceded(space0, identifier),
+        }
+    }
+    .parse_next(input)
 }
 
-fn enum_type(input: Span) -> IResult<Span, Node, VerboseError<Span>> {
-    map(
-        tuple((
-            comment_block,
-            preceded(ws(tag("enum")), identifier),
-            block(terminated(separated_list1(comma, enum_member), opt(comma))),
-        )),
-        |(doc_str, name, members)| Node::Enum {
-            name,
-            members,
-            doc_str,
-        },
-    )(input)
+fn enum_type<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
+    seq!(
+        comment_block,
+        preceded(ws("enum"), cut_err(identifier)),
+        cut_err(block(terminated(
+            separated(1.., enum_member, comma),
+            opt(comma)
+        )))
+        .context(StrContext::Label("enum block")),
+    )
+    .map(|(doc_str, name, members)| Node::Enum {
+        name,
+        members,
+        doc_str,
+    })
+    .parse_next(input)
 }
-fn member_declaration<'input>(
-    input: Span<'input>,
-) -> IResult<Span<'input>, Member, VerboseError<Span>> {
-    map(
-        tuple((
-            comment_block,
-            preceded(space0, identifier),
-            colon,
-            identifier,
-        )),
-        |(doc_str, name, _, datatype)| Member::Declaration {
+fn member_declaration<'i>(input: &mut Stream<'i>) -> PResult<Member<'i>> {
+    (
+        comment_block,
+        preceded(space0, identifier),
+        colon,
+        identifier,
+    )
+        .context(StrContext::Label("member declaration"))
+        .map(|(doc_str, name, _, datatype)| Member::Declaration {
             name,
             datatype,
             doc_str,
-        },
-    )(input)
+        })
+        .parse_next(input)
 }
 
-fn assignment<'input>(
-    input: Span<'input>,
-) -> IResult<Span<'input>, (Vec<&str>, &str, char, MemberValue), VerboseError<Span>> {
-    tuple((
+fn assignment<'i>(
+    input: &mut Stream<'i>,
+) -> PResult<(Vec<&'i str>, &'i str, char, MemberValue<'i>)> {
+    (
         comment_block,
         preceded(space0, identifier),
         assign,
         constant,
-    ))(input)
+    )
+        .context(StrContext::Label("assignment"))
+        .parse_next(input)
 }
 
-fn object_assignment<'input>(
-    input: Span<'input>,
-) -> IResult<Span<'input>, ObjectMember, VerboseError<Span>> {
-    map(assignment, |(doc_str, name, _, value)| ObjectMember {
-        name,
-        value,
-        doc_str,
-    })(input)
+fn object_assignment<'i>(input: &mut Stream<'i>) -> PResult<ObjectMember<'i>> {
+    assignment
+        .map(|(doc_str, name, _, value)| ObjectMember {
+            name,
+            value,
+            doc_str,
+        })
+        .parse_next(input)
 }
 
-fn object_constant<'input>(
-    input: Span<'input>,
-) -> IResult<Span<'input>, MemberValue<'input>, VerboseError<Span>> {
-    map(
-        tuple((
-            identifier,
-            block(terminated(
-                separated_list0(comma, object_assignment),
-                opt(comma),
-            )),
+fn object_constant<'i>(input: &mut Stream<'i>) -> PResult<MemberValue<'i>> {
+    (
+        identifier,
+        block(terminated(
+            separated(0.., object_assignment, comma),
+            opt(comma),
         )),
-        |(datatype, members)| MemberValue::Object { datatype, members },
-    )(input)
+    )
+        .map(|(datatype, members)| MemberValue::Object { datatype, members })
+        .parse_next(input)
 }
 
-fn constant<'input>(
-    input: Span<'input>,
-) -> IResult<Span<'input>, MemberValue<'input>, VerboseError<Span>> {
+fn constant<'i>(input: &mut Stream<'i>) -> PResult<MemberValue<'i>> {
     alt((
         object_constant,
-        map(value_constant, |c| MemberValue::Const(c)),
-    ))(input)
+        value_constant.map(|c| MemberValue::Const(c)),
+    ))
+    .parse_next(input)
 }
 
-fn member_assignment<'input>(
-    input: Span<'input>,
-) -> IResult<Span<'input>, Member, VerboseError<Span>> {
-    map(assignment, |(doc_str, name, _, value)| Member::Assignment {
-        name,
-        value,
-        doc_str,
-    })(input)
-}
-
-fn member_definition<'input>(
-    input: Span<'input>,
-) -> IResult<Span<'input>, Member, VerboseError<Span>> {
-    alt((member_assignment, member_declaration))(input)
-}
-
-fn class_type(input: Span) -> IResult<Span, Node, VerboseError<Span>> {
-    map(
-        tuple((
-            comment_block,
-            preceded(ws(tag("type")), identifier),
-            opt(preceded(colon, identifier)),
-            block(terminated(
-                separated_list0(comma, member_definition),
-                opt(comma),
-            )),
-        )),
-        |(doc_str, name, super_type, members)| {
-            Node::Class {
-                name,
-                super_type,
-                members,
-                doc_str,
-            }
-        },
-    )(input)
-}
-
-fn module(input: Span) -> IResult<Span, Node, VerboseError<Span>> {
-    let (input, doc_str) = comment_block(input)?;
-    let (input, name) = preceded(ws(tag("module")), identifier)(input)?;
-    let (input, members) = block(many0(multi_ws(module_declaration)))(input)?;
-    Ok((
-        input,
-        Node::Module {
+fn member_assignment<'i>(input: &mut Stream<'i>) -> PResult<Member<'i>> {
+    assignment
+        .map(|(doc_str, name, _, value)| Member::Assignment {
             name,
+            value,
+            doc_str,
+        })
+        .parse_next(input)
+}
+
+fn member_definition<'i>(input: &mut Stream<'i>) -> PResult<Member<'i>> {
+    alt((member_assignment, member_declaration)).parse_next(input)
+}
+
+fn class_type<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
+    (
+        comment_block,
+        preceded(ws("type"), identifier),
+        opt(preceded(colon, identifier)),
+        block(terminated(
+            separated(0.., member_definition, comma),
+            opt(comma),
+        )),
+    )
+        .map(|(doc_str, name, super_type, members)| Node::Class {
+            name,
+            super_type,
             members,
             doc_str,
-        },
-    ))
+        })
+        .parse_next(input)
 }
 
-fn import(input: Span) -> IResult<Span, Node, VerboseError<Span>> {
-    map(preceded(ws(tag("import")), sub_identifier),|name|{
-        Node::Import { name }
-    })(input)
+fn module<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
+    let doc_str = comment_block.parse_next(input)?;
+    let name = preceded(ws("module"), identifier).parse_next(input)?;
+    let members = block(repeat(0.., multi_ws(module_declaration))).parse_next(input)?;
+    Ok(Node::Module {
+        name,
+        members,
+        doc_str,
+    })
 }
 
-fn module_declaration(input: Span) -> IResult<Span, Node, VerboseError<Span>> {
-    alt((import, enum_type, class_type, module))(input)
+fn import<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
+    preceded(ws("import"), sub_identifier::<0>)
+        .map(|name| Node::Import { name })
+        .parse_next(input)
 }
 
-pub fn parse_schema(input: &str) -> IResult<Span, Vec<Node>, VerboseError<Span>> {
-    let input = input.into();
-    terminated(many0(multi_ws(module_declaration)), eof)(input)
+fn module_declaration<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
+    alt((import, enum_type, class_type, module))
+        .context(StrContext::Label("declarations"))
+        .parse_next(input)
+}
+
+pub fn parse_schema<'i>(input: &mut Stream<'i>) -> PResult<Vec<Node<'i>>> {
+    terminated(repeat(0.., multi_ws(module_declaration)), eof)
+        .context(StrContext::Label("schema"))
+        .parse_next(input)
 }
 
 // Element example
 // server = Process{
 //      os = "FreeBSD-14"
 // }
-fn element_assign(input: Span) -> IResult<Span, Node, VerboseError<Span>> {
-    map(
-        tuple((
-            comment_block,
-            preceded(space0, identifier),
-            assign,
+fn element_assign<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
+    (
+        comment_block,
+        preceded(space0, identifier),
+        assign,
+        cut_err((
             identifier,
             block(terminated(
-                separated_list0(comma, object_assignment),
+                separated(0.., object_assignment, comma),
                 opt(comma),
             )),
         )),
-        |(doc_str, name, _, datatype, members)| Node::Element {
+    )
+        .context(StrContext::Label("element assignment"))
+        .map(|(doc_str, name, _, (datatype, members))| Node::Element {
             name,
             datatype,
             members,
             doc_str,
-        },
-    )(input)
+        })
+        .parse_next(input)
 }
 
 // Flow example
 // client -> server = Type {}
-fn flow_assign(input: Span) -> IResult<Span, Node, VerboseError<Span>> {
-    map(
-        tuple((
-            comment_block,
-            preceded(space0, identifier),
-            ws(tag("->")),
+fn flow_assign<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
+    (
+        comment_block,
+        preceded(space0, identifier),
+        ws("->"),
+        cut_err((
             identifier,
             assign,
             identifier,
             block(terminated(
-                separated_list0(comma, object_assignment),
+                separated(0.., object_assignment, comma),
                 opt(comma),
             )),
         )),
-        |(doc_str, from, _, to, _, datatype, members)| Node::Flow {
-            from,
-            to,
-            datatype,
-            members,
+    )
+        .context(StrContext::Label("flow assignment"))
+        .map(
+            |(doc_str, from, _, (to, _, datatype, members))| Node::Flow {
+                from,
+                to,
+                datatype,
+                members,
+                doc_str,
+            },
+        )
+        .parse_next(input)
+}
+
+fn sequence<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
+    (
+        comment_block,
+        preceded(space0, "seq"),
+        opt(ws(identifier)),
+        block(repeat(0.., flow_assign)),
+    )
+        .context(StrContext::Label("sequence"))
+        .map(|(doc_str, _, name, flows)| Node::Sequence {
+            name,
+            flows,
             doc_str,
-        },
-    )(input)
+        })
+        .parse_next(input)
 }
 
-fn sequence(input: Span) -> IResult<Span, Node, VerboseError<Span>> {
-    map(
-        tuple((
-            comment_block,
-            preceded(space0, tag("seq")),
-            opt(ws(identifier)),
-            block(many0(flow_assign))
-        )),
-        |(doc_str, _,name, flows)| Node::Sequence { name, flows, doc_str }
-    )(input)
-
-
+fn model_declaration<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
+    alt((module_declaration, element_assign, flow_assign, sequence))
+        .context(StrContext::Label("model_declaration"))
+        .parse_next(input)
 }
 
-fn model_declaration(input: Span) -> IResult<Span, Node, VerboseError<Span>> {
-    alt((module_declaration, element_assign, flow_assign))(input)
-}
-
-pub fn parse_model<'input>(input: &'input str) -> Result<Vec<Node<'input>>, VerboseError<Span>> {
-    let (_rest, ast) = terminated(many0(multi_ws(model_declaration)), eof)(input).finish()?;
-    Ok(ast)
+pub fn parse_model<'i>(input: &'i str) -> PResult<Vec<Node<'i>>> {
+    let input = Stream::new(input);
+    trace(
+        "model",
+        terminated(repeat(0.., multi_ws(model_declaration)), eof),
+    )
+    .context(StrContext::Label("model"))
+    .parse_next(&mut input.into())
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use core::fmt::Debug;
-
-    fn check_rest<T: Debug>(result: IResult<Span, T, VerboseError<Span>>) -> T {
-        let (rest, value) = result.unwrap();
-        assert_eq!(rest, "");
-        value
-    }
 
     #[test]
     fn test_comment() {
-        let result = check_rest(comment_line(" # "));
+        let result = comment_line(&mut Located::new(" # ")).unwrap();
         assert_eq!(result, "");
     }
     #[test]
     fn test_comment2() {
-        let result = check_rest(comment_line(" # lol  asdasd"));
+        let result = comment_line(&mut Located::new(" # lol  asdasd")).unwrap();
         assert_eq!(result, "lol  asdasd");
     }
 
     #[test]
     fn test_comment_single_block() {
-        let result = check_rest(comment_block("# lol222\n"));
+        let result = comment_block(&mut Located::new("# lol222\n")).unwrap();
         assert_eq!(result, vec!["lol222"]);
     }
 
     #[test]
     fn test_comment_block() {
-        let result = check_rest(comment_block(
+        let result = comment_block(&mut Located::new(
             "# lol
-                # lol2\n"
-                ,
-        ));
+                # lol2\n",
+        ))
+        .unwrap();
         assert_eq!(result, vec!["lol", "lol2"]);
     }
     #[test]
     fn test_comment_block_lead_newline() {
-        let result = check_rest(comment_block(
+        let result = comment_block(&mut Located::new(
             "
 
                 # lol
-                # lol2\n"
-                ,
-        ));
+                # lol2\n",
+        ))
+        .unwrap();
         assert_eq!(result, vec!["lol", "lol2"]);
     }
 
     #[test]
     fn test_class() {
-        let result = check_rest(parse_schema(
+        let result = parse_schema(&mut Located::new(
             "
                 type File { bool:Bool, test:String, }",
-        ));
+        ))
+        .unwrap();
         if let Node::Class {
             name,
             super_type,
@@ -800,7 +840,10 @@ mod test {
     }
     #[test]
     fn test_class_assignment() {
-        let result = check_rest(parse_schema(" type File { bool = true, test:String, }"));
+        let result = parse_schema(&mut Located::new(
+            " type File { bool = true, test:String, }",
+        ))
+        .unwrap();
         if let Node::Class {
             name,
             super_type,
@@ -830,7 +873,7 @@ mod test {
     }
     #[test]
     fn test_class_super() {
-        let result = check_rest(parse_schema(" type File:Super { bool:Bool, }"));
+        let result = parse_schema(&mut Located::new(" type File:Super { bool:Bool, }")).unwrap();
         if let Node::Class {
             name,
             super_type,
@@ -854,7 +897,7 @@ mod test {
     }
     #[test]
     fn test_enum() {
-        let result = check_rest(parse_schema(" enum Level { Test, Lol }"));
+        let result = parse_schema(&mut Located::new(" enum Level { Test, Lol }")).unwrap();
         if let Node::Enum {
             name,
             members,
@@ -862,22 +905,38 @@ mod test {
         } = &result[0]
         {
             assert_eq!(*name, "Level");
-            assert_eq!(members[0], "Test");
-            assert_eq!(members[1], "Lol");
+            assert_eq!(
+                members[0],
+                EnumMember {
+                    name: "Test",
+                    doc_str: vec![]
+                }
+            );
+            assert_eq!(
+                members[1],
+                EnumMember {
+                    name: "Lol",
+                    doc_str: vec![]
+                }
+            );
         } else {
             assert!(false);
         }
     }
     #[test]
     fn test_module() {
-        let result = check_rest(parse_schema(" module mqtt { enum Publish{Bla, }}"));
+        let result =
+            parse_schema(&mut Located::new(" module mqtt { enum Publish{Bla, }}")).unwrap();
         if let Node::Module { name, members, .. } = &result[0] {
             assert_eq!(*name, "mqtt");
             assert_eq!(
                 members[0],
                 Node::Enum {
                     name: "Publish",
-                    members: vec!["Bla"],
+                    members: vec![EnumMember {
+                        name: "Bla",
+                        doc_str: vec![]
+                    }],
                     doc_str: vec![]
                 }
             );
@@ -901,10 +960,7 @@ type Datastore {
     
 }
 
-enum Severity {
-    High,
-    Low,
-}
+enum Severity { High, Low, }
 enum TextFormat {
     ASCII,
     UTF8,
@@ -955,7 +1011,7 @@ module MQTT {
     }
 }
         ";
-        let result = check_rest(parse_schema(test_str));
+        let result = parse_schema(&mut Located::new(test_str.into())).unwrap();
         if let Node::Class {
             name,
             super_type,
@@ -985,52 +1041,52 @@ module MQTT {
     }
     #[test]
     fn test_bool() {
-        assert_eq!(check_rest(bool("true")), Constant::Bool(true));
-        assert_eq!(check_rest(bool("false")), Constant::Bool(false));
+        assert_eq!(
+            bool(&mut Located::new("true")).unwrap(),
+            Constant::Bool(true)
+        );
+        assert_eq!(
+            bool(&mut Located::new("false")).unwrap(),
+            Constant::Bool(false)
+        );
     }
     #[test]
     fn test_string() {
-        assert_eq!(check_rest(string("\"\"")), Constant::Str("".into()));
         assert_eq!(
-            check_rest(string("\"test\"")),
+            string(&mut Located::new("\"\"")).unwrap(),
+            Constant::Str("".into())
+        );
+        assert_eq!(
+            string(&mut Located::new("\"test\"")).unwrap(),
             Constant::Str("test")
         );
-        //assert_eq!(check_rest(string("\"te_st\"")), Term::Str("test"));
-        //assert_eq!(check_rest(string("\"te  st\"")), Term::Str("te  st"));
     }
-//    #[test]
-//    fn test_atom() {
-//        assert_eq!(
-//            check_rest(atom("test.test")),
-//            Constant::Atom("test.test")
-//        );
-//    }
     #[test]
     fn test_int() {
-        assert_eq!(check_rest(int("15")), Constant::Int(15));
-        assert_eq!(check_rest(int("0x15")), Constant::Int(0x15));
-        assert_eq!(check_rest(int("0xFE")), Constant::Int(0xfe));
-        assert_eq!(check_rest(int("-15")), Constant::Int(-15));
-        assert_eq!(check_rest(int("0")), Constant::Int(0));
+        assert_eq!(int(&mut Located::new("15")).unwrap(), Constant::Int(15));
+        assert_eq!(int(&mut Located::new("0x15")).unwrap(), Constant::Int(0x15));
+        assert_eq!(int(&mut Located::new("0xFE")).unwrap(), Constant::Int(0xfe));
+        assert_eq!(int(&mut Located::new("-15")).unwrap(), Constant::Int(-15));
+        assert_eq!(int(&mut Located::new("0")).unwrap(), Constant::Int(0));
     }
     #[test]
     fn test_member() {
         assert_eq!(
-            check_rest(member::<0>(".a")),
+            member::<0>(&mut Located::new(".a")).unwrap(),
             Operation::Member {
                 name: ".a".into(),
                 pos: 0
             }
         );
         assert_eq!(
-            check_rest(member::<0>(".a.b")),
+            member::<0>(&mut Located::new(".a.b")).unwrap(),
             Operation::Member {
                 name: ".a.b".into(),
                 pos: 0
             }
         );
         assert_eq!(
-            check_rest(member::<0>(".a.b.xyz")),
+            member::<0>(&mut Located::new(".a.b.xyz")).unwrap(),
             Operation::Member {
                 name: ".a.b.xyz".into(),
                 pos: 0
@@ -1039,17 +1095,26 @@ module MQTT {
     }
     #[test]
     fn test_comp_op() {
-        assert_eq!(check_rest(comp_op("==")), Operation::Equal);
-        assert_eq!(check_rest(comp_op("!=")), Operation::NotEqual);
-        assert_eq!(check_rest(comp_op("<")), Operation::Lesser);
-        assert_eq!(check_rest(comp_op(">")), Operation::Greater);
-        assert_eq!(check_rest(comp_op("<=")), Operation::LesserEq);
-        assert_eq!(check_rest(comp_op(">=")), Operation::GreaterEq);
+        assert_eq!(comp_op(&mut Located::new("==")).unwrap(), Operation::Equal);
+        assert_eq!(
+            comp_op(&mut Located::new("!=")).unwrap(),
+            Operation::NotEqual
+        );
+        assert_eq!(comp_op(&mut Located::new("<")).unwrap(), Operation::Lesser);
+        assert_eq!(comp_op(&mut Located::new(">")).unwrap(), Operation::Greater);
+        assert_eq!(
+            comp_op(&mut Located::new("<=")).unwrap(),
+            Operation::LesserEq
+        );
+        assert_eq!(
+            comp_op(&mut Located::new(">=")).unwrap(),
+            Operation::GreaterEq
+        );
     }
     #[test]
     fn test_comp_expr() {
         assert_eq!(
-            check_rest(comp_expr(".a==.b")),
+            comp_expr(&mut Located::new(".a==.b")).unwrap(),
             vec![
                 Operation::Member {
                     name: ".a".into(),
@@ -1063,7 +1128,7 @@ module MQTT {
             ]
         );
         assert_eq!(
-            check_rest(comp_expr(".a!=5")),
+            comp_expr(&mut Located::new(".a!=5")).unwrap(),
             vec![
                 Operation::Member {
                     name: ".a".into(),
@@ -1074,7 +1139,7 @@ module MQTT {
             ]
         );
         assert_eq!(
-            check_rest(comp_expr(".abc<\"lol\"")),
+            comp_expr(&mut Located::new(".abc<\"lol\"")).unwrap(),
             vec![
                 Operation::Member {
                     name: ".abc".into(),
@@ -1085,7 +1150,7 @@ module MQTT {
             ]
         );
         assert_eq!(
-            check_rest(comp_expr("4>.abc")),
+            comp_expr(&mut Located::new("4>.abc")).unwrap(),
             vec![
                 Operation::Int(4),
                 Operation::Member {
@@ -1096,7 +1161,7 @@ module MQTT {
             ]
         );
         assert_eq!(
-            check_rest(comp_expr("42 > .abc")),
+            comp_expr(&mut Located::new("42 > .abc")).unwrap(),
             vec![
                 Operation::Int(42),
                 Operation::Member {
@@ -1107,15 +1172,18 @@ module MQTT {
             ]
         );
         assert_eq!(
-            check_rest(comp_expr("true")),
+            comp_expr(&mut Located::new("true")).unwrap(),
             vec![Operation::Bool(true)]
         );
-        assert_eq!(check_rest(comp_expr("5")), vec![Operation::Int(5)]);
+        assert_eq!(
+            comp_expr(&mut Located::new("5")).unwrap(),
+            vec![Operation::Int(5)]
+        );
     }
     #[test]
     fn test_not_expr() {
         assert_eq!(
-            check_rest(comp_expr("42 > not .abc")),
+            comp_expr(&mut Located::new("42 > not .abc")).unwrap(),
             vec![
                 Operation::Int(42),
                 Operation::Member {
@@ -1127,18 +1195,18 @@ module MQTT {
             ]
         );
         assert_eq!(
-            check_rest(comp_expr("not true")),
+            comp_expr(&mut Located::new("not true")).unwrap(),
             vec![Operation::Bool(true), Operation::Not]
         );
         assert_eq!(
-            check_rest(comp_expr("not 5")),
+            comp_expr(&mut Located::new("not 5")).unwrap(),
             vec![Operation::Int(5), Operation::Not]
         );
     }
     #[test]
     fn test_logic_expr() {
         assert_eq!(
-            check_rest(logic_and(".a==.b and .abc")),
+            logic_and(&mut Located::new(".a==.b and .abc")).unwrap(),
             vec![
                 Operation::Member {
                     name: ".a".into(),
@@ -1157,7 +1225,7 @@ module MQTT {
             ]
         );
         assert_eq!(
-            check_rest(logic_and(".a == .b    and    .abc")),
+            logic_and(&mut Located::new(".a == .b    and    .abc")).unwrap(),
             vec![
                 Operation::Member {
                     name: ".a".into(),
@@ -1176,7 +1244,7 @@ module MQTT {
             ]
         );
         assert_eq!(
-            check_rest(logic_and(".a == .b and .abc and .test")),
+            logic_and(&mut Located::new(".a == .b and .abc and .test")).unwrap(),
             vec![
                 Operation::Member {
                     name: ".a".into(),
@@ -1200,7 +1268,7 @@ module MQTT {
             ]
         );
         assert_eq!(
-            check_rest(logic_or(".a == .b or .abc and .test")),
+            logic_or(&mut Located::new(".a == .b or .abc and .test")).unwrap(),
             vec![
                 Operation::Member {
                     name: ".a".into(),
@@ -1224,7 +1292,7 @@ module MQTT {
             ]
         );
         assert_eq!(
-            check_rest(logic_or("(.a == .b or .abc) and .test")),
+            logic_or(&mut Located::new("(.a == .b or .abc) and .test")).unwrap(),
             vec![
                 Operation::Member {
                     name: ".a".into(),
@@ -1251,9 +1319,7 @@ module MQTT {
     #[test]
     fn example_query() {
         assert_eq!(
-            check_rest(parse_query(
-                "  ( .a ==  .b   or   .abc )   and   not .test  "
-            )),
+            parse_query("  ( .a ==  .b   or   .abc )   and   not .test  ").unwrap(),
             Query::new(
                 [
                     Operation::Member {

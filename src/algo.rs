@@ -85,13 +85,7 @@ fn extend_subgraph_isomorphism(
                     next_candidates[v_qnode.index()].remove(&y_mnode);
                 }
             }
-            if refine_subgraph_isomorphism(
-                query,
-                model,
-                &mut next_candidates,
-                v_qnode,
-                w_mnode
-            ) {
+            if refine_subgraph_isomorphism(query, model, &mut next_candidates, v_qnode, w_mnode) {
                 if q_nodes.peek().is_none() {
                     // fully matched
                     let mapping: Option<Vec<_>> = mapping.into_iter().map(|x| *x).collect();
@@ -178,17 +172,22 @@ fn refine_subgraph_isomorphism(
 mod test {
     use std::rc::Rc;
 
-    use crate::{Flow, ModelCompiler, QFlow, QueryGraphBuilder, types::{ClassRef, Class}, parser::parse_model};
+    use crate::{
+        parser::parse_model,
+        types::{Class, ClassRef},
+        Flow, ModelCompiler, QFlow, QueryGraphBuilder,
+    };
 
     use super::*;
-    fn obj() -> ClassRef{
+    fn obj() -> ClassRef {
         Rc::new(Class::new("obj"))
     }
 
     fn create_model() -> ModelCompiler {
         let mut model = ModelCompiler::new(vec![]);
 
-        let ast = parse_model("
+        let ast = parse_model(
+            "
                               type Client {
                                   bool: Bool,
                                   client: Bool,
@@ -214,7 +213,9 @@ mod test {
 
                               client -> server = Flow {}
                               server -> client = Flow {}
-                              ").unwrap();
+                              ",
+        )
+        .unwrap();
 
         model.compile(&ast).unwrap();
         model
@@ -228,7 +229,6 @@ mod test {
         let other = model.get_element("other").unwrap();
 
         let model = model.build();
-
 
         let mut query = QueryGraphBuilder::new();
         query.add(QElement::new("true").unwrap());
@@ -265,10 +265,10 @@ mod test {
         let mut model = ModelCompiler::new(vec![]);
         let client = model.add(Element::new(obj()));
         let server = model.add(Element::new(obj()));
-        let other =  model.add(Element::new(obj()));
+        let other = model.add(Element::new(obj()));
 
         let request_login = model.connect(client, server, Flow::new(obj()));
-        let result_login = model.connect(client, server,  Flow::new(obj()));
+        let result_login = model.connect(client, server, Flow::new(obj()));
         let result_login2 = model.connect(server, client, Flow::new(obj()));
         let model = model.build();
 

@@ -25,6 +25,7 @@ impl<'object> From<&'object Value> for StackValue<'object> {
             Value::Bool(b) => StackValue::Bool(*b),
             Value::Str(v) => StackValue::Str(v),
             Value::Int(v) => StackValue::Int(*v),
+            Value::EnumValue(_) => todo!(),
             Value::Object(_v) => todo!(),
         }
     }
@@ -73,6 +74,9 @@ pub fn execute(query: &Query, element: &ValueTree) -> Result<Decision, Execution
             }
             Operation::Str(value) => {
                 stack.push(StackValue::Str(value));
+            }
+            Operation::EnumValue(value) => {
+                todo!("");
             }
             Operation::Member { name: path, pos: p } => match element.get(path) {
                 Some(value) => {
@@ -251,11 +255,11 @@ mod test {
 
     use super::*;
     use crate::parser::parse_query;
-    use crate::ValueTree;
     use crate::types::Type;
     use crate::types::{Class, ClassRef};
-    
-    fn obj() -> ClassRef{
+    use crate::ValueTree;
+
+    fn obj() -> ClassRef {
         Rc::new(Class::new("obj"))
     }
 
@@ -271,47 +275,32 @@ mod test {
     }
     #[test]
     fn test_parser() {
-        let (_rest, code) = parse_query("true").unwrap();
-        assert_eq!(
-            execute(&code, &ValueTree::new(obj())),
-            Ok(Decision::Match)
-        );
+        let code = parse_query("true").unwrap();
+        assert_eq!(execute(&code, &ValueTree::new(obj())), Ok(Decision::Match));
     }
     #[test]
     fn test_eq() {
-        let (_rest, code) = parse_query("true == true").unwrap();
-        assert_eq!(
-            execute(&code, &ValueTree::new(obj())),
-            Ok(Decision::Match)
-        );
+        let code = parse_query("true == true").unwrap();
+        assert_eq!(execute(&code, &ValueTree::new(obj())), Ok(Decision::Match));
     }
     #[test]
     fn test_noteq() {
-        let (_rest, code) = parse_query("false != true").unwrap();
-        assert_eq!(
-            execute(&code, &ValueTree::new(obj())),
-            Ok(Decision::Match)
-        );
+        let code = parse_query("false != true").unwrap();
+        assert_eq!(execute(&code, &ValueTree::new(obj())), Ok(Decision::Match));
     }
     #[test]
     fn test_gteq() {
-        let (_rest, code) = parse_query("60 >= 4").unwrap();
-        assert_eq!(
-            execute(&code, &ValueTree::new(obj())),
-            Ok(Decision::Match)
-        );
+        let code = parse_query("60 >= 4").unwrap();
+        assert_eq!(execute(&code, &ValueTree::new(obj())), Ok(Decision::Match));
     }
     #[test]
     fn test_gt() {
-        let (_rest, code) = parse_query("60 > 4").unwrap();
-        assert_eq!(
-            execute(&code, &ValueTree::new(obj())),
-            Ok(Decision::Match)
-        );
+        let code = parse_query("60 > 4").unwrap();
+        assert_eq!(execute(&code, &ValueTree::new(obj())), Ok(Decision::Match));
     }
     #[test]
     fn test_lt() {
-        let (_rest, code) = parse_query("60 < 4").unwrap();
+        let code = parse_query("60 < 4").unwrap();
         assert_eq!(
             execute(&code, &ValueTree::new(obj())),
             Ok(Decision::Difference(Reason::Unequal))
@@ -319,7 +308,7 @@ mod test {
     }
     #[test]
     fn test_lteq() {
-        let (_rest, code) = parse_query("60 <= 4").unwrap();
+        let code = parse_query("60 <= 4").unwrap();
         assert_eq!(
             execute(&code, &ValueTree::new(obj())),
             Ok(Decision::Difference(Reason::Unequal))
@@ -327,7 +316,7 @@ mod test {
     }
     #[test]
     fn test_and() {
-        let (_rest, code) = parse_query("60 <= 4 and true").unwrap();
+        let code = parse_query("60 <= 4 and true").unwrap();
         assert_eq!(
             execute(&code, &ValueTree::new(obj())),
             Ok(Decision::Difference(Reason::Unequal))
@@ -335,11 +324,8 @@ mod test {
     }
     #[test]
     fn test_or() {
-        let (_rest, code) = parse_query("60 <= 4 and true or true").unwrap();
-        assert_eq!(
-            execute(&code, &ValueTree::new(obj())),
-            Ok(Decision::Match)
-        );
+        let code = parse_query("60 <= 4 and true or true").unwrap();
+        assert_eq!(execute(&code, &ValueTree::new(obj())), Ok(Decision::Match));
     }
     #[test]
     fn test_member() {
@@ -366,13 +352,13 @@ mod test {
         vt.insert("test", Value::Bool(true)).unwrap();
         vt.insert("a", Value::Object(a_value)).unwrap();
 
-        let (_rest, code) = parse_query(".test").unwrap();
+        let code = parse_query(".test").unwrap();
         assert_eq!(execute(&code, &vt), Ok(Decision::Match));
-        let (_rest, code) = parse_query(".test and .a.b.c").unwrap();
+        let code = parse_query(".test and .a.b.c").unwrap();
         assert_eq!(execute(&code, &vt), Ok(Decision::Match));
-        let (_rest, code) = parse_query(".test and .a.b.d == 10").unwrap();
+        let code = parse_query(".test and .a.b.d == 10").unwrap();
         assert_eq!(execute(&code, &vt), Ok(Decision::Match));
-        let (_rest, code) = parse_query(".test or .a.b.c ").unwrap();
+        let code = parse_query(".test or .a.b.c ").unwrap();
         assert_eq!(execute(&code, &vt), Ok(Decision::Match));
     }
 }

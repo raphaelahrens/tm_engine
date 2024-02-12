@@ -1,14 +1,19 @@
-use std::{collections::{btree_map::Entry, BTreeMap, BTreeSet}, path::{Path, PathBuf}, fs::File, io::Read};
+use std::{
+    collections::{btree_map::Entry, BTreeMap, BTreeSet},
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use thiserror::Error;
 mod algo;
 mod interpreter;
-mod types;
 pub mod parser;
+mod types;
 
 pub use interpreter::{Decision, ExecutionError, Reason};
 
-pub use parser::Span;
+pub use parser::Stream;
 
 use petgraph::{
     graph::{EdgeIndex, NodeIndex},
@@ -20,25 +25,25 @@ use fixedbitset::FixedBitSet;
 
 use self::parser::{Constant, Member, MemberValue, Node, ObjectMember};
 
-const EXTENSION:&str = "tm";
+const EXTENSION: &str = "tm";
 
 type Str = Box<str>;
 
 #[derive(Error, Debug, PartialEq)]
-pub enum RunError<'nom> {
-    #[error("Type miss match")]
-    ParseError(nom::Err<nom::error::VerboseError<Span<'nom>>>),
+pub enum RunError {
+    #[error("Parsing Error")]
+    ParseError(winnow::error::ErrMode<winnow::error::ContextError>),
 }
-impl<'nom> From<nom::Err<nom::error::VerboseError<Span<'nom>>>> for RunError<'nom> {
-    fn from(sub: nom::Err<nom::error::VerboseError<Span<'nom>>>) -> RunError<'nom> {
-        RunError::ParseError(sub)
+impl<'nom> From<winnow::error::ErrMode<winnow::error::ContextError>> for RunError {
+    fn from(sub: winnow::error::ErrMode<winnow::error::ContextError>) -> Self {
+        Self::ParseError(sub)
     }
 }
 
 #[derive(Debug)]
-pub struct ParserErrorItem{
+pub struct ParserErrorItem {
     pub input: String,
-    pub error: nom::error::VerboseErrorKind,
+    pub error: winnow::error::ErrorKind,
 }
 
 #[derive(Error, Debug)]
@@ -58,26 +63,19 @@ pub enum CompileError {
     #[error("Use of an undefined element variable.")]
     UndefinedElement,
     #[error("A membervaribale was not defined.\n {missing_members:?}")]
-    UndefinedMember{
+    UndefinedMember {
         missing_members: Vec<(String, String)>,
     },
     #[error("Strange module name.")]
     StrangeModule,
     #[error("Can not find module")]
     ModuleNotFound,
-    #[error("Parsing error\n {errors:?}")]
-    ParseError{
-        errors : Vec<ParserErrorItem>
-    }
+    #[error("Parsing error {0:?}")]
+    ParseError(winnow::error::ErrMode<winnow::error::ContextError>),
 }
-impl<'nom> From<nom::error::VerboseError<Span<'nom>>> for CompileError {
-    fn from(sub: nom::error::VerboseError<Span<'nom>>) -> Self {
-        Self::ParseError{
-            // TODO check if there is a better way to convert the error or to deal with the
-            // lifetimes
-            errors: sub.errors.iter().map(|(input, e)| ParserErrorItem{input: input.to_string(), error:e.clone()}
-                                          ).collect()
-        }
+impl From<winnow::error::ErrMode<winnow::error::ContextError>> for CompileError {
+    fn from(sub: winnow::error::ErrMode<winnow::error::ContextError>) -> Self {
+        CompileError::ParseError(sub)
     }
 }
 
@@ -86,6 +84,7 @@ pub enum Value {
     Bool(bool),
     Int(i64),
     Str(Str),
+    EnumValue(Str),
     Object(ValueTree),
 }
 
@@ -102,11 +101,15 @@ impl Value {
     fn str(value: &str) -> Self {
         Value::Str(value.into())
     }
+    fn enum_value(value: &str) -> Self {
+        Value::EnumValue(value.into())
+    }
     fn get_type(&self) -> types::Type {
         match self {
             Self::Bool(_) => types::Type::Bool,
             Self::Int(_) => types::Type::Int,
             Self::Str(_) => types::Type::Str,
+            Self::EnumValue(_) => types::Type::Enum,
             Self::Object(value_tree) => types::Type::Class(value_tree.datatype.clone()),
         }
     }
@@ -138,6 +141,7 @@ impl From<&Constant<'_>> for Value {
             Constant::Bool(b) => Value::bool(b),
             Constant::Str(v) => Value::str(v),
             Constant::Int(v) => Value::int(v),
+            Constant::EnumValue(v) => Value::enum_value(v),
         }
     }
 }
@@ -152,15 +156,12 @@ impl ValueTree {
     fn new(datatype: types::ClassRef) -> Self {
         let tree = datatype.default_value();
 
-        Self {
-            tree,
-            datatype,
-        }
+        Self { tree, datatype }
     }
 
     fn insert(&mut self, key: &str, value: Value) -> Result<(), CompileError> {
         self.datatype.check_member_type(key, &value)?;
-        if let Some(_) = self.tree.insert(key.into(), value){
+        if let Some(_) = self.tree.insert(key.into(), value) {
             //return Err(CompileError::RedefinedMember);
         }
         Ok(())
@@ -186,22 +187,23 @@ impl ValueTree {
         }
         value
     }
-    pub fn check(&self) -> Result<(),CompileError> {
-        let mut missing_members = self.datatype
+    pub fn check(&self) -> Result<(), CompileError> {
+        let mut missing_members = self
+            .datatype
             .members()
-            .filter(|(member_name, _)| {
-                !self.tree.contains_key(*member_name)
-        }).peekable();
+            .filter(|(member_name, _)| !self.tree.contains_key(*member_name))
+            .peekable();
         if missing_members.peek().is_some() {
-            let errors = missing_members.map(|(member_name, datatype)| {
-                (format!("{}", member_name), format!("{}", datatype))
-            }).collect();
-            return Err(CompileError::UndefinedMember{
-                missing_members: errors
+            let errors = missing_members
+                .map(|(member_name, datatype)| {
+                    (format!("{}", member_name), format!("{}", datatype))
+                })
+                .collect();
+            return Err(CompileError::UndefinedMember {
+                missing_members: errors,
             });
         }
         Ok(())
-       
     }
 }
 
@@ -254,7 +256,7 @@ impl ModelCompiler {
             graph: Graph::new(),
             types: types::TypeTable::new(),
             element_map: BTreeMap::new(),
-            path
+            path,
         }
     }
     fn get_type(&self, name: &str) -> Result<types::Type, CompileError> {
@@ -295,14 +297,14 @@ impl ModelCompiler {
                     members,
                     doc_str: _,
                 } => {
-                    let mut new_class =if let Some(super_type) = super_type {
+                    let mut new_class = if let Some(super_type) = super_type {
                         let s = self.types.get_class(super_type)?;
                         types::Class::sub_class(name, s)
-                    } else{
-                     types::Class::new(name)
+                    } else {
+                        types::Class::new(name)
                     };
                     for m in members {
-                         match m {
+                        match m {
                             Member::Declaration {
                                 name,
                                 datatype,
@@ -330,7 +332,7 @@ impl ModelCompiler {
                 } => {
                     let mut variants = BTreeSet::new();
                     for member in members {
-                        if !variants.insert((*member).into()) {
+                        if !variants.insert((member.name).into()) {
                             return Err(CompileError::RedefinedEnumVariants);
                         }
                     }
@@ -351,7 +353,6 @@ impl ModelCompiler {
                     }
                     element.0.check()?;
                     self.add_by_name(name, element)?;
-                    
                 }
                 Node::Flow {
                     from,
@@ -359,15 +360,12 @@ impl ModelCompiler {
                     datatype,
                     members,
                     doc_str,
-                } => {
-                    self.add_node_flow(from, to, datatype, members, doc_str)?
-                }
+                } => self.add_node_flow(from, to, datatype, members, doc_str)?,
                 Node::Sequence {
                     name,
                     flows,
                     doc_str,
-                } => {
-                }
+                } => {}
                 Node::Module {
                     name,
                     members,
@@ -375,42 +373,40 @@ impl ModelCompiler {
                 } => {
                     todo!();
                 }
-                Node::Import {
-                    name,
-                } => {
-                    let module_name = if let Some(n) = name.split('.').next(){
+                Node::Import { name } => {
+                    let module_name = if let Some(n) = name.split('.').next() {
                         let mut path = PathBuf::from(n);
                         path.set_extension(EXTENSION);
                         path
                     } else {
                         return Err(CompileError::StrangeModule);
                     };
-                    let mut candidates = self.path
+                    let mut candidates = self
+                        .path
                         .iter()
                         .map(|p| p.join(&module_name))
                         .filter(|x| x.exists());
-                    if let Some(candidate) = candidates.next(){
+                    if let Some(candidate) = candidates.next() {
                         self.compile_file(&candidate)?;
                     } else {
-                        return Err(CompileError::ModuleNotFound)
+                        return Err(CompileError::ModuleNotFound);
                     }
-
-                    
                 }
             }
         }
         Ok(())
     }
 
-    fn add_node_flow(&mut self,
-                    from: &str,
-                    to: &str,
-                    datatype: &str,
-                    members: &Vec<ObjectMember>,
-                    _doc_str: &Vec<&str>,
-        )-> Result<(), CompileError>{
-        let from =  self.get_element(from)?;
-        let to =  self.get_element(to)?;
+    fn add_node_flow(
+        &mut self,
+        from: &str,
+        to: &str,
+        datatype: &str,
+        members: &Vec<ObjectMember>,
+        _doc_str: &Vec<&str>,
+    ) -> Result<(), CompileError> {
+        let from = self.get_element(from)?;
+        let to = self.get_element(to)?;
         let classtype = self.types.get_class(datatype)?;
         let mut flow = Flow::new(classtype.clone());
         for member in members {
@@ -418,21 +414,20 @@ impl ModelCompiler {
             flow.insert(member.name, member_value)?;
         }
         flow.0.check()?;
-        
+
         self.connect(from, to, flow);
         Ok(())
     }
 
-
     fn add(&mut self, e: Element) -> NodeIndex {
         self.graph.add_node(e)
     }
-    fn add_by_name(&mut self,name: &str, e: Element) -> Result<(), CompileError> {
+    fn add_by_name(&mut self, name: &str, e: Element) -> Result<(), CompileError> {
         let entry = self.element_map.entry(name.into());
-        match entry{
+        match entry {
             Entry::Occupied(_) => {
                 return Err(CompileError::RedefinedElement);
-            },
+            }
             Entry::Vacant(vacant_entry) => {
                 let idx = self.graph.add_node(e);
                 vacant_entry.insert(idx);
@@ -441,11 +436,14 @@ impl ModelCompiler {
         Ok(())
     }
     fn get_element(&self, name: &str) -> Result<NodeIndex, CompileError> {
-        let idx = self.element_map.get(name).ok_or(CompileError::UndefinedElement)?;
+        let idx = self
+            .element_map
+            .get(name)
+            .ok_or(CompileError::UndefinedElement)?;
         Ok(*idx)
     }
 
-    pub fn compile_file(&mut self, path: &Path) -> Result<(), CompileError>{
+    pub fn compile_file(&mut self, path: &Path) -> Result<(), CompileError> {
         let mut file = File::open(path)?;
 
         let mut model_str = String::new();
@@ -515,14 +513,14 @@ pub struct QElement(parser::Query);
 
 impl QElement {
     fn new(query: &str) -> Result<Self, RunError> {
-        let (_rest, query) = parser::parse_query(query)?;
+        let query = parser::parse_query(query)?;
         Ok(Self(query))
     }
 }
 pub struct QFlow(parser::Query);
 impl QFlow {
     pub fn new(query: &str) -> Result<Self, RunError> {
-        let (_rest, query) = parser::parse_query(query)?;
+        let query = parser::parse_query(query)?;
         Ok(Self(query))
     }
 }
@@ -532,8 +530,8 @@ mod test {
     use super::*;
 
     fn create_model() -> Model {
-
-        let ast = parser::parse_model("
+        let ast = parser::parse_model(
+            "
                             type Client {
                                 bool: Bool,
                                 client: Bool,
@@ -561,7 +559,9 @@ mod test {
                             client -> server = Dummy{ }
                             # login result
                             server -> client = Dummy{ }
-                            ").unwrap();
+                            ",
+        )
+        .unwrap();
         let mut model = ModelCompiler::new(vec![]);
         model.compile(&ast).unwrap();
         model.build()

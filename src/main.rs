@@ -1,11 +1,11 @@
 use std::fs::File;
 use std::io::Read;
-use std::path::{PathBuf, Path};
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use eyre::{Result, eyre};
+use eyre::{eyre, Result};
 
-use petgraph::dot::{Dot, Config};
+use petgraph::dot::{Config, Dot};
 
 use tm_engine::parser::parse_model;
 use tm_engine::ModelCompiler;
@@ -37,8 +37,11 @@ fn build_model(model: &Path, path: PathBuf) -> Result<()> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    
-    let parent_dir = args.model.parent().ok_or(eyre!("Could not find parent directory"))?;
+
+    let parent_dir = args
+        .model
+        .parent()
+        .ok_or(eyre!("Could not find parent directory"))?;
     build_model(&args.model, parent_dir.to_path_buf())?;
     Ok(())
 }
