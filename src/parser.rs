@@ -25,7 +25,7 @@ use winnow::{
         digit1, hex_digit1, line_ending, multispace0, multispace1, space0, space1, till_line_ending,
     },
     combinator::{
-        alt, cut_err, delimited, eof, fail, opt, preceded, repeat, separated, terminated, Repeat
+        alt, cut_err, delimited, eof, fail, opt, preceded, repeat, separated, separated_pair, terminated, Repeat
     },
     error::{ContextError, ParserError, StrContext},
     prelude::*,
@@ -59,6 +59,18 @@ where
         space0.context(StrContext::Label("trailing space")),
     )
 }
+fn ws1<'i, F, O, E>(inner: F) -> impl Parser<Stream<'i>, O, E>
+where
+    E: ParserError<Stream<'i>>
+        + for<'a> winnow::error::AddContext<winnow::Located<&'a str>, winnow::error::StrContext>,
+    F: Parser<Stream<'i>, O, E>,
+{
+    delimited(
+        space1.context(StrContext::Label("leading space")),
+        inner.context(StrContext::Label("inner")),
+        space1.context(StrContext::Label("trailing space")),
+    )
+}
 
 fn multi_ws<'i, F, O, E>(inner: F) -> impl Parser<Stream<'i>, O, E>
 where
@@ -70,6 +82,18 @@ where
         multispace0.context(StrContext::Label("leading space")),
         inner.context(StrContext::Label("inner")),
         multispace0.context(StrContext::Label("trailing space")),
+    )
+}
+fn multi_ws1<'i, F, O, E>(inner: F) -> impl Parser<Stream<'i>, O, E>
+where
+    E: ParserError<Stream<'i>>
+        + for<'a> winnow::error::AddContext<winnow::Located<&'a str>, winnow::error::StrContext>,
+    F: Parser<Stream<'i>, O, E>,
+{
+    delimited(
+        multispace1.context(StrContext::Label("leading space")),
+        inner.context(StrContext::Label("inner")),
+        multispace1.context(StrContext::Label("trailing space")),
     )
 }
 
@@ -194,13 +218,13 @@ fn value_constant<'i>(input: &mut Stream<'i>) -> PResult<Constant<'i>> {
         )).parse_next(input)
 }
 
-fn member<'i, const N: usize>(input: &mut Stream) -> PResult<Operation> {
+fn member<'i, const N: usize>(input: &mut Stream) -> PResult<Vec<Operation>> {
     repeat::<_, _, (), _, _>(1.., preceded('.', identifier))
         .recognize()
-        .map(|s| Operation::Member {
+        .map(|s| vec![Operation::Member {
             name: (*s).into(),
             pos: N,
-        })
+        }])
         .parse_next(input)
 }
 
@@ -216,8 +240,17 @@ fn comp_op<'i>(input: &mut Stream) -> PResult<Operation> {
     .parse_next(input)
 }
 
-fn term<'i, const N: usize>(input: &mut Stream) -> PResult<Operation> {
-    alt((member::<N>, value_constant.map(|c| c.into()))).parse_next(input)
+fn term<'i, const N: usize>(input: &mut Stream) -> PResult<Vec<Operation>> {
+    alt((member::<N>, value_constant.map(|c| vec![c.into()]))).parse_next(input)
+}
+
+fn in_expr<'i, const N: usize>(input: &mut Stream) -> PResult<Vec<Operation>> {
+    alt((
+            separated_pair(term::<0>, ws1("in"), member::<1>).map(|(a,b)|collapse_tree(a, b, Operation::In)
+         ),
+            term::<N>,
+            ))
+    .parse_next(input)
 }
 
 fn not_expr<'i, const N: usize>(input: &mut Stream) -> PResult<Vec<Operation>> {
@@ -226,7 +259,7 @@ fn not_expr<'i, const N: usize>(input: &mut Stream) -> PResult<Vec<Operation>> {
             e.push(Operation::Not);
             e
         }),
-        term::<N>.map(|t| vec![t]),
+        in_expr::<N>,
     ))
     .parse_next(input)
 }
@@ -249,8 +282,8 @@ fn collapse_tree<'a>(
 
 fn comp_expr<'i>(input: &mut Stream) -> PResult<Vec<Operation>> {
     alt((
-        (not_expr::<0>, space0, comp_op, space0, not_expr::<1>)
-            .map(|(a, _, op, _, b)| collapse_tree(a, b, op)),
+        (not_expr::<0>, ws(comp_op), not_expr::<1>)
+            .map(|(a, op, b)| collapse_tree(a, b, op)),
         not_expr::<0>,
         parents_expr,
     ))
@@ -259,8 +292,8 @@ fn comp_expr<'i>(input: &mut Stream) -> PResult<Vec<Operation>> {
 
 fn logic_and<'i>(input: &mut Stream) -> PResult<Vec<Operation>> {
     alt((
-        (comp_expr, multispace1, "and", multispace1, logic_and)
-            .map(|(a, _, _, _, b)| collapse_tree(a, b, Operation::And)),
+        separated_pair(comp_expr, multi_ws1("and"), logic_and)
+            .map(|(a, b)| collapse_tree(a, b, Operation::And)),
         comp_expr,
     ))
     .parse_next(input)
@@ -268,8 +301,8 @@ fn logic_and<'i>(input: &mut Stream) -> PResult<Vec<Operation>> {
 
 fn logic_or<'i>(input: &mut Stream) -> PResult<Vec<Operation>> {
     alt((
-        (logic_and, multispace1, "or", multispace1, logic_or)
-            .map(|(a, _, _, _, b)| collapse_tree(a, b, Operation::Or)),
+        separated_pair(logic_and, multi_ws1("or"), logic_or)
+            .map(|(a, b)| collapse_tree(a, b, Operation::Or)),
         logic_and,
     ))
     .parse_next(input)
@@ -1060,24 +1093,30 @@ module MQTT {
     fn test_member() {
         assert_eq!(
             member::<0>(&mut Located::new(".a")).unwrap(),
+            vec![
             Operation::Member {
                 name: ".a".into(),
                 pos: 0
             }
+            ]
         );
         assert_eq!(
             member::<0>(&mut Located::new(".a.b")).unwrap(),
+            vec![
             Operation::Member {
                 name: ".a.b".into(),
                 pos: 0
             }
+            ]
         );
         assert_eq!(
             member::<0>(&mut Located::new(".a.b.xyz")).unwrap(),
+            vec![
             Operation::Member {
                 name: ".a.b.xyz".into(),
                 pos: 0
             }
+            ]
         );
     }
     #[test]

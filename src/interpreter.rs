@@ -10,6 +10,8 @@ pub enum ExecutionError {
     EmptyStack,
     #[error("Top of the stack is not a Bool")]
     ResultTypeError,
+    #[error("The argument was expected to be of type X")]
+    ArgumentTypeError,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -28,6 +30,7 @@ pub enum Operation {
     NotEqual,
     And,
     Or,
+    In,
 }
 
 impl Operation {
@@ -42,6 +45,7 @@ impl Operation {
             Self::Not => '!',
             Self::And => '∧',
             Self::Or => '∨',
+            Self::In => '∊',
             Self::Bool(false) => '0',
             Self::Bool(true) => '1',
             Self::Str(_) => '"',
@@ -182,6 +186,19 @@ impl<'object> From<&'object Value> for StackValue<'object> {
             Value::List(values) => StackValue::List(values),
             Value::EnumValue(..) => todo!(),
             Value::Object(v) => StackValue::Object(v),
+        }
+    }
+}
+
+impl<'object> PartialEq<Value> for StackValue<'object> {
+    fn eq(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Self::Bool(a), Value::Bool(b)) =>{a==b},
+            (Self::Int(a), Value::Int(b)) =>{a==b},
+            (Self::Str(a), Value::Str(b)) =>{**a==**b},
+            (Self::List(a), Value::List(b)) =>{a==b},
+            (Self::Object(a), Value::Object(b)) =>{*a==b},
+            _ => false
         }
     }
 }
@@ -394,6 +411,21 @@ pub fn execute(query: &Query, element: &ValueTree) -> Result<Decision, Execution
                     return Err(ExecutionError::EmptyStack);
                 }
             }
+            Operation::In => {
+                let b = stack.pop();
+                let a = stack.pop();
+                if let (Some(a), Some(b)) = (a, b) {
+                    if let StackValue::List(b_list) = b {
+                        let result = b_list.iter().any(|e| a == *e);
+                        let result = StackValue::Bool(result);
+                        stack.push(result);
+                    } else {
+                        return Err(ExecutionError::ArgumentTypeError);
+                    }
+                } else {
+                    return Err(ExecutionError::EmptyStack);
+                }
+            }
         }
     }
     // Final Result shoould be at the end of the stack
@@ -515,6 +547,22 @@ mod test {
         let code = parse_query(".test and .a.b.d == 10").unwrap();
         assert_eq!(execute(&code, &vt), Ok(Decision::Match));
         let code = parse_query(".test or .a.b.c ").unwrap();
+        assert_eq!(execute(&code, &vt), Ok(Decision::Match));
+    }
+    #[test]
+    fn test_in_op() {
+        let mut new_class = Class::new("new_class");
+        new_class.add_member("list", UnionType::new(vec![Type::List(UnionType::new(vec![Type::Int]))])).unwrap();
+        new_class.add_member("list2", UnionType::new(vec![Type::List(UnionType::new(vec![Type::Int]))])).unwrap();
+        let new_class = Rc::new(new_class);
+
+        let mut vt = ValueTree::new(new_class);
+        vt.insert("list", Value::List(vec![Value::int(4)])).unwrap();
+        vt.insert("list", Value::List(vec![Value::int(8), Value::int(4), Value::int(10), Value::int(7), Value::int(13), Value::int(40), Value::int(5)])).unwrap();
+
+        let code = parse_query("4 in .list").unwrap();
+        assert_eq!(execute(&code, &vt), Ok(Decision::Match));
+        let code = parse_query("5 in .list2").unwrap();
         assert_eq!(execute(&code, &vt), Ok(Decision::Match));
     }
 }
