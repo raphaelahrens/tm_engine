@@ -1,5 +1,5 @@
+use std::fmt;
 use crate::{
-    parser::{Operation, Query},
     Value, ValueTree,
 };
 use thiserror::Error;
@@ -12,11 +12,165 @@ pub enum ExecutionError {
     ResultTypeError,
 }
 
-#[derive(PartialEq, Debug)]
-enum StackValue<'input> {
+#[derive(Clone, Debug, PartialEq)]
+pub enum Operation {
     Bool(bool),
-    Str(&'input str),
+    Str(Box<str>),
     Int(i64),
+    EnumValue(Box<str>),
+    Member { name: Box<str>, pos: usize },
+    Not,
+    Greater,
+    GreaterEq,
+    Equal,
+    LesserEq,
+    Lesser,
+    NotEqual,
+    And,
+    Or,
+}
+
+impl Operation {
+    pub fn short_symbol(&self) -> char {
+        match self {
+            Self::LesserEq => '≤',
+            Self::Lesser => '<',
+            Self::Equal => '=',
+            Self::NotEqual => '≠',
+            Self::Greater => '>',
+            Self::GreaterEq => '≥',
+            Self::Not => '!',
+            Self::And => '∧',
+            Self::Or => '∨',
+            Self::Bool(false) => '0',
+            Self::Bool(true) => '1',
+            Self::Str(_) => '"',
+            Self::Int(_) => '#',
+            Self::EnumValue(_) => 'E',
+            Self::Member { name, .. } => {
+                let mut iter = name.chars().skip(1);
+                match iter.next() {
+                    None => '?',
+                    Some(c) => c,
+                }
+            }
+        }
+    }
+}
+#[derive(PartialEq)]
+pub struct Query {
+    pub ops: Box<[Operation]>,
+    pub false_jumps: Box<[usize]>,
+    pub true_jumps: Box<[usize]>,
+}
+
+fn set_jump(ops: &[Operation], false_jumps: &mut Vec<usize>, index: usize, argn: usize) {
+    match ops.get(index) {
+        Some(Operation::Member { pos, .. }) => {
+            false_jumps.insert(index, argn - pos);
+        }
+        Some(_other) => {}
+        None => {} //ignore this
+    }
+}
+
+impl Query {
+    pub fn new(ops: Box<[Operation]>) -> Self {
+        let mut false_jumps = vec![0; ops.len()];
+        let true_jumps = vec![0; ops.len()];
+
+        for (i, op) in ops.iter().enumerate() {
+            match op {
+                Operation::Greater
+                | Operation::GreaterEq
+                | Operation::Equal
+                | Operation::LesserEq
+                | Operation::Lesser
+                | Operation::NotEqual => {
+                    set_jump(&ops, &mut false_jumps, i - 1, 2);
+                    set_jump(&ops, &mut false_jumps, i - 2, 2);
+                }
+                Operation::Not => {
+                    set_jump(&ops, &mut false_jumps, i - 1, 1);
+                }
+                _ => {}
+            }
+        }
+
+        for i in (0..false_jumps.len() - 1).rev() {
+            let old = false_jumps[i];
+            let next_jump = false_jumps[i + old];
+            false_jumps[i] = old + next_jump;
+        }
+        Query {
+            ops,
+            false_jumps: false_jumps.into_boxed_slice(),
+            true_jumps: true_jumps.into_boxed_slice(),
+        }
+    }
+    pub fn iter(&self) -> QueryIter {
+        QueryIter {
+            query: self,
+            next: 0,
+        }
+    }
+}
+
+impl fmt::Debug for Query {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ops: String = self.ops.iter().map(Operation::short_symbol).collect();
+        let members: Vec<&Box<str>> = self
+            .ops
+            .iter()
+            .filter_map(|op| {
+                if let Operation::Member { name, .. } = op {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        f.debug_struct("Query")
+            .field("ops", &ops)
+            .field("members", &members)
+            .finish()
+    }
+}
+
+pub struct QueryIter<'query> {
+    query: &'query Query,
+    next: usize,
+}
+
+impl<'query> Iterator for QueryIter<'query> {
+    type Item = (&'query Operation, usize, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.next;
+
+        let op = self.query.ops.get(current)?;
+        let false_jump = self.query.false_jumps.get(current)?;
+        let true_jump = self.query.true_jumps.get(current)?;
+
+        self.next = current + 1;
+
+        // Since there's no endpoint to a Fibonacci sequence, the `Iterator`
+        // will never return `None`, and `Some` is always returned.
+        Some((op, *false_jump, *true_jump))
+    }
+}
+/* I need to reconsider this.
+ * Maybe this should be just bytes without a type and the type is in the Operation?
+ * For now this is clearly safer.
+ */
+#[derive(PartialEq, Debug)]
+enum StackValue<'object> {
+    Bool(bool),
+    Str(&'object str),
+    Int(i64),
+    Object(&'object ValueTree),
+    List(&'object[Value]),
 }
 
 impl<'object> From<&'object Value> for StackValue<'object> {
@@ -25,8 +179,9 @@ impl<'object> From<&'object Value> for StackValue<'object> {
             Value::Bool(b) => StackValue::Bool(*b),
             Value::Str(v) => StackValue::Str(v),
             Value::Int(v) => StackValue::Int(*v),
-            Value::EnumValue(_) => todo!(),
-            Value::Object(_v) => todo!(),
+            Value::List(values) => StackValue::List(values),
+            Value::EnumValue(..) => todo!(),
+            Value::Object(v) => StackValue::Object(v),
         }
     }
 }
@@ -241,6 +396,7 @@ pub fn execute(query: &Query, element: &ValueTree) -> Result<Decision, Execution
             }
         }
     }
+    // Final Result shoould be at the end of the stack
     match stack.pop() {
         Some(StackValue::Bool(true)) => Ok(Decision::Match),
         Some(StackValue::Bool(false)) => Ok(Decision::Difference(Reason::Unequal)),
@@ -255,7 +411,7 @@ mod test {
 
     use super::*;
     use crate::parser::parse_query;
-    use crate::types::Type;
+    use crate::types::{Type, UnionType};
     use crate::types::{Class, ClassRef};
     use crate::ValueTree;
 
@@ -330,16 +486,16 @@ mod test {
     #[test]
     fn test_member() {
         let mut b = Class::new("b");
-        b.add_member("c", Type::Bool).unwrap();
-        b.add_member("d", Type::Int).unwrap();
+        b.add_member("c", UnionType::new(vec![Type::Bool])).unwrap();
+        b.add_member("d", UnionType::new(vec![Type::Int])).unwrap();
         let b = Rc::new(b);
         let mut a = Class::new("a");
-        a.add_member("b", Type::Class(b.clone())).unwrap();
+        a.add_member("b", UnionType::new(vec![Type::Class(b.clone())])).unwrap();
         let a = Rc::new(a);
 
         let mut new_class = Class::new("new_class");
-        new_class.add_member("a", Type::Class(a.clone())).unwrap();
-        new_class.add_member("test", Type::Bool).unwrap();
+        new_class.add_member("a", UnionType::new(vec![Type::Class(a.clone())])).unwrap();
+        new_class.add_member("test", UnionType::new(vec![Type::Bool])).unwrap();
         let new_class = Rc::new(new_class);
 
         let mut b_value = ValueTree::new(b);

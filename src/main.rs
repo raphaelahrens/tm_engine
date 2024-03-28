@@ -1,12 +1,8 @@
-
-
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use eyre::{eyre, Result};
-
-use petgraph::dot::{Dot};
-
+use petgraph::dot::Dot;
 
 use tm_engine::ModelCompiler;
 

@@ -18,7 +18,6 @@
  * WHITESPACE = _{ " " | "\t" | "\n" }
 */
 
-use std::fmt;
 use std::ops::RangeInclusive;
 
 use winnow::{
@@ -26,13 +25,18 @@ use winnow::{
         digit1, hex_digit1, line_ending, multispace0, multispace1, space0, space1, till_line_ending,
     },
     combinator::{
-        alt, cut_err, delimited, eof, opt, preceded, repeat, separated, terminated, trace, Repeat,
+        alt, cut_err, delimited, eof, fail, opt, preceded, repeat, separated, terminated, Repeat
     },
-    error::{ParserError, StrContext},
+    error::{ContextError, ParserError, StrContext},
     prelude::*,
     seq,
     token::{any, none_of, one_of, take_while},
     Located,
+};
+
+use crate::interpreter::{
+    Operation,
+    Query,
 };
 
 const ALPHA: (RangeInclusive<char>, RangeInclusive<char>) = ('a'..='z', 'A'..='Z');
@@ -74,54 +78,9 @@ pub enum Constant<'input> {
     Bool(bool),
     Str(&'input str),
     Int(i64),
-    EnumValue(&'input str),
+    List(Vec<Constant<'input>>),
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Operation {
-    Bool(bool),
-    Str(Box<str>),
-    Int(i64),
-    EnumValue(Box<str>),
-    Member { name: Box<str>, pos: usize },
-    Not,
-    Greater,
-    GreaterEq,
-    Equal,
-    LesserEq,
-    Lesser,
-    NotEqual,
-    And,
-    Or,
-}
-
-impl Operation {
-    fn short_symbol(&self) -> char {
-        match self {
-            Self::LesserEq => '≤',
-            Self::Lesser => '<',
-            Self::Equal => '=',
-            Self::NotEqual => '≠',
-            Self::Greater => '>',
-            Self::GreaterEq => '≥',
-            Self::Not => '!',
-            Self::And => '∧',
-            Self::Or => '∨',
-            Self::Bool(false) => '0',
-            Self::Bool(true) => '1',
-            Self::Str(_) => '"',
-            Self::Int(_) => '#',
-            Self::EnumValue(_) => 'E',
-            Self::Member { name, .. } => {
-                let mut iter = name.chars().skip(1);
-                match iter.next() {
-                    None => '?',
-                    Some(c) => c,
-                }
-            }
-        }
-    }
-}
 
 impl From<Constant<'_>> for Operation {
     fn from(item: Constant) -> Self {
@@ -129,111 +88,8 @@ impl From<Constant<'_>> for Operation {
             Constant::Bool(b) => Operation::Bool(b),
             Constant::Str(v) => Operation::Str(v.into()),
             Constant::Int(v) => Operation::Int(v),
-            Constant::EnumValue(v) => Operation::EnumValue(v.into()),
+            Constant::List(_v) => todo!(),
         }
-    }
-}
-#[derive(PartialEq)]
-pub struct Query {
-    pub ops: Box<[Operation]>,
-    pub false_jumps: Box<[usize]>,
-    pub true_jumps: Box<[usize]>,
-}
-
-fn set_jump(ops: &[Operation], false_jumps: &mut Vec<usize>, index: usize, argn: usize) {
-    match ops.get(index) {
-        Some(Operation::Member { pos, .. }) => {
-            false_jumps.insert(index, argn - pos);
-        }
-        Some(_other) => {}
-        None => {} //ignore this
-    }
-}
-
-impl Query {
-    pub fn new(ops: Box<[Operation]>) -> Self {
-        let mut false_jumps = vec![0; ops.len()];
-        let true_jumps = vec![0; ops.len()];
-
-        for (i, op) in ops.iter().enumerate() {
-            match op {
-                Operation::Greater
-                | Operation::GreaterEq
-                | Operation::Equal
-                | Operation::LesserEq
-                | Operation::Lesser
-                | Operation::NotEqual => {
-                    set_jump(&ops, &mut false_jumps, i - 1, 2);
-                    set_jump(&ops, &mut false_jumps, i - 2, 2);
-                }
-                Operation::Not => {
-                    set_jump(&ops, &mut false_jumps, i - 1, 1);
-                }
-                _ => {}
-            }
-        }
-
-        for i in (0..false_jumps.len() - 1).rev() {
-            let old = false_jumps[i];
-            let next_jump = false_jumps[i + old];
-            false_jumps[i] = old + next_jump;
-        }
-        Query {
-            ops,
-            false_jumps: false_jumps.into_boxed_slice(),
-            true_jumps: true_jumps.into_boxed_slice(),
-        }
-    }
-    pub fn iter(&self) -> QueryIter {
-        QueryIter {
-            query: self,
-            next: 0,
-        }
-    }
-}
-
-impl fmt::Debug for Query {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let ops: String = self.ops.iter().map(Operation::short_symbol).collect();
-        let members: Vec<&Box<str>> = self
-            .ops
-            .iter()
-            .filter_map(|op| {
-                if let Operation::Member { name, .. } = op {
-                    Some(name)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        f.debug_struct("Query")
-            .field("ops", &ops)
-            .field("members", &members)
-            .finish()
-    }
-}
-
-pub struct QueryIter<'query> {
-    query: &'query Query,
-    next: usize,
-}
-
-impl<'query> Iterator for QueryIter<'query> {
-    type Item = (&'query Operation, usize, usize);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let current = self.next;
-
-        let op = self.query.ops.get(current)?;
-        let false_jump = self.query.false_jumps.get(current)?;
-        let true_jump = self.query.true_jumps.get(current)?;
-
-        self.next = current + 1;
-
-        // Since there's no endpoint to a Fibonacci sequence, the `Iterator`
-        // will never return `None`, and `Some` is always returned.
-        Some((op, *false_jump, *true_jump))
     }
 }
 fn bool<'i>(input: &mut Stream<'i>) -> PResult<Constant<'i>> {
@@ -289,9 +145,10 @@ fn identifier<'i>(input: &mut Stream<'i>) -> PResult<&'i str> {
         .parse_next(input)
 }
 
-fn sub_identifier<'i, const N: usize>(input: &mut Stream<'i>) -> PResult<&'i str> {
-    let prefix: Repeat<_, _, _, (), _> = repeat(N.., preceded(identifier, '.'));
-    preceded(prefix, identifier).recognize().parse_next(input)
+fn sub_identifier<'i, const N: usize>(input: &mut Stream<'i>) -> PResult<Vec<&'i str>> {
+    //let prefix: Repeat<_, _, _, (), _> = repeat(N.., preceded(identifier, '.'));
+    //preceded(prefix, identifier).recognize().parse_next(input)
+    separated(N.., identifier, '.').parse_next(input)
 }
 
 fn int<'i>(input: &mut Stream) -> PResult<Constant<'i>> {
@@ -310,15 +167,31 @@ fn int<'i>(input: &mut Stream) -> PResult<Constant<'i>> {
     .parse_next(input)
 }
 
-fn enum_value<'i>(input: &mut Stream<'i>) -> PResult<Constant<'i>> {
-    sub_identifier::<1>
+fn enum_value<'i>(input: &mut Stream<'i>) -> PResult<MemberValue<'i>> {
+    sub_identifier::<2>
         .with_span()
-        .map(|(s, _r)| Constant::EnumValue(s))
+        .map(|(mut items, _r)| {
+            let Some(value) = items.pop() else {todo!("can't happen")};
+            MemberValue::Enum{
+                datatype: items,
+                value
+            }
+        })
         .parse_next(input)
 }
 
+
+fn list_constant<'i>(input: &mut Stream<'i>) -> PResult<Constant<'i>> {
+    delimited('[', separated(0.., value_constant, ','), ']').map(|list| Constant::List(list)).parse_next(input)
+}
+
 fn value_constant<'i>(input: &mut Stream<'i>) -> PResult<Constant<'i>> {
-    alt((bool, int, string, enum_value)).parse_next(input)
+    alt((
+            bool,
+            int,
+            string,
+            list_constant
+        )).parse_next(input)
 }
 
 fn member<'i, const N: usize>(input: &mut Stream) -> PResult<Operation> {
@@ -413,7 +286,7 @@ pub enum Node<'input> {
     Class {
         name: &'input str,
         super_type: Option<&'input str>,
-        members: Vec<Member<'input>>,
+        members: Vec<ClassMember<'input>>,
         doc_str: Vec<&'input str>,
     },
     Enum {
@@ -427,7 +300,7 @@ pub enum Node<'input> {
         doc_str: Vec<&'input str>,
     },
     Import {
-        name: &'input str,
+        name: Vec<&'input str>,
     },
     Element {
         name: &'input str,
@@ -447,13 +320,30 @@ pub enum Node<'input> {
         flows: Vec<Node<'input>>,
         doc_str: Vec<&'input str>,
     },
+    Comment(Vec<&'input str>),
 }
 
 #[derive(Debug, PartialEq)]
-pub enum Member<'input> {
+pub struct UnionType<'input>(Vec<Datatype<'input>>);
+
+impl <'input> UnionType<'input> {
+    pub fn iter(&self) -> std::slice::Iter<Datatype> {
+        self.0.iter()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Datatype<'input> {
+    List(UnionType<'input>),
+    //Datatype can be a Vec since we can have a union of multiple types
+    SingleType(&'input str)
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ClassMember<'input> {
     Declaration {
         name: &'input str,
-        datatype: &'input str,
+        datatype: UnionType<'input>,
         doc_str: Vec<&'input str>,
     },
     Assignment {
@@ -482,6 +372,10 @@ pub enum MemberValue<'input> {
         datatype: &'input str,
         members: Vec<ObjectMember<'input>>,
     },
+    Enum{
+        datatype: Vec<&'input str>,
+        value: &'input str
+    },
     Const(Constant<'input>),
 }
 
@@ -494,15 +388,17 @@ where
     delimited(
         multi_ws('{').context(StrContext::Label("{")),
         inner,
-        multi_ws('}'),
+        multi_ws(
+            cut_err('}'.context(StrContext::Label("}")))
+            ),
     )
 }
 
-pub fn comment_line<'i>(input: &mut Stream<'i>) -> PResult<&'i str> {
+fn comment_line<'i>(input: &mut Stream<'i>) -> PResult<&'i str> {
     preceded(ws('#'), till_line_ending).parse_next(input)
 }
 
-pub fn comment_block<'i>(input: &mut Stream<'i>) -> PResult<Vec<&'i str>> {
+fn comment_block<'i>(input: &mut Stream<'i>) -> PResult<Vec<&'i str>> {
     preceded(
         multispace0,
         repeat(0.., terminated(comment_line, line_ending)),
@@ -511,6 +407,37 @@ pub fn comment_block<'i>(input: &mut Stream<'i>) -> PResult<Vec<&'i str>> {
     .parse_next(input)
 }
 
+fn comment_node<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
+    repeat(1.., comment_line).map(|comments | Node::Comment(comments)).parse_next(input)
+}
+
+fn named_type<'i>(input: &mut Stream<'i>) -> PResult<Datatype<'i>> {
+    dbg!("st");
+    identifier.map(|name| {dbg!(name); Datatype::SingleType(name)})
+        .parse_next(input)
+}
+
+fn type_declartion<'i>(input: &mut Stream<'i>) -> PResult<UnionType<'i>> {
+    dbg!("ut");
+    separated(1.., list_type, ws('|')).map(
+        |types|UnionType(types)
+        )
+        .parse_next(input)
+}
+fn list_type<'i>(input: &mut Stream<'i>) -> PResult<Datatype<'i>> {
+    dbg!("lt");
+    alt((
+        named_type,
+        delimited('[', type_declartion, ']') .map(|inner_type|{
+            dbg!(&inner_type);
+            Datatype::List(inner_type)
+        })
+    )).parse_next(input)
+}
+fn class_name<'i>(input: &mut Stream<'i>) -> PResult<&'i str> {
+    identifier
+        .parse_next(input)
+}
 fn assign<'i>(input: &mut Stream<'i>) -> PResult<char> {
     multi_ws('=').parse_next(input)
 }
@@ -552,20 +479,29 @@ fn enum_type<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
     })
     .parse_next(input)
 }
-fn member_declaration<'i>(input: &mut Stream<'i>) -> PResult<Member<'i>> {
+fn member_declaration<'i>(input: &mut Stream<'i>) -> PResult<ClassMember<'i>> {
     (
         comment_block,
         preceded(space0, identifier),
         colon,
-        identifier,
+        type_declartion,
     )
         .context(StrContext::Label("member declaration"))
-        .map(|(doc_str, name, _, datatype)| Member::Declaration {
+        .map(|(doc_str, name, _, datatype)| ClassMember::Declaration {
             name,
             datatype,
             doc_str,
         })
         .parse_next(input)
+}
+
+fn constant<'i>(input: &mut Stream<'i>) -> PResult<MemberValue<'i>> {
+    alt((
+        object_constant,
+        enum_value,
+        value_constant.map(|c| MemberValue::Const(c)),
+    ))
+    .parse_next(input)
 }
 
 fn assignment<'i>(
@@ -583,6 +519,7 @@ fn assignment<'i>(
 
 fn object_assignment<'i>(input: &mut Stream<'i>) -> PResult<ObjectMember<'i>> {
     assignment
+        .context(StrContext::Label("object_assignment"))
         .map(|(doc_str, name, _, value)| ObjectMember {
             name,
             value,
@@ -603,17 +540,10 @@ fn object_constant<'i>(input: &mut Stream<'i>) -> PResult<MemberValue<'i>> {
         .parse_next(input)
 }
 
-fn constant<'i>(input: &mut Stream<'i>) -> PResult<MemberValue<'i>> {
-    alt((
-        object_constant,
-        value_constant.map(|c| MemberValue::Const(c)),
-    ))
-    .parse_next(input)
-}
-
-fn member_assignment<'i>(input: &mut Stream<'i>) -> PResult<Member<'i>> {
+fn member_assignment<'i>(input: &mut Stream<'i>) -> PResult<ClassMember<'i>> {
     assignment
-        .map(|(doc_str, name, _, value)| Member::Assignment {
+        .context(StrContext::Label("member_assignment"))
+        .map(|(doc_str, name, _, value)| ClassMember::Assignment {
             name,
             value,
             doc_str,
@@ -621,15 +551,15 @@ fn member_assignment<'i>(input: &mut Stream<'i>) -> PResult<Member<'i>> {
         .parse_next(input)
 }
 
-fn member_definition<'i>(input: &mut Stream<'i>) -> PResult<Member<'i>> {
+fn member_definition<'i>(input: &mut Stream<'i>) -> PResult<ClassMember<'i>> {
     alt((member_assignment, member_declaration)).parse_next(input)
 }
 
 fn class_type<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
     (
         comment_block,
-        preceded(ws("type"), identifier),
-        opt(preceded(colon, identifier)),
+        preceded(ws("type"), class_name),
+        opt(preceded(colon, class_name)),
         block(terminated(
             separated(0.., member_definition, comma),
             opt(comma),
@@ -656,13 +586,13 @@ fn module<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
 }
 
 fn import<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
-    preceded(ws("import"), sub_identifier::<0>)
+    preceded(ws("import"), sub_identifier::<1>)
         .map(|name| Node::Import { name })
         .parse_next(input)
 }
 
 fn module_declaration<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
-    alt((import, enum_type, class_type, module))
+    alt((import, enum_type, class_type, module, comment_node))
         .context(StrContext::Label("declarations"))
         .parse_next(input)
 }
@@ -733,7 +663,7 @@ fn flow_assign<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
 fn sequence<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
     (
         comment_block,
-        preceded(space0, "seq"),
+        preceded(space0, "seq").context(StrContext::Label("seq")),
         opt(ws(identifier)),
         block(repeat(0.., flow_assign)),
     )
@@ -747,19 +677,22 @@ fn sequence<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
 }
 
 fn model_declaration<'i>(input: &mut Stream<'i>) -> PResult<Node<'i>> {
-    alt((module_declaration, element_assign, flow_assign, sequence))
+    alt((
+            module_declaration,
+            element_assign,
+            flow_assign,
+            sequence,
+            preceded(any, cut_err(fail.context(StrContext::Label("Unrecognized symbol"))))
+        ))
         .context(StrContext::Label("model_declaration"))
         .parse_next(input)
 }
 
-pub fn parse_model<'i>(input: &'i str) -> PResult<Vec<Node<'i>>> {
+pub fn parse_model<'i>(input: &'i str) -> Result<Vec<Node<'i>>, winnow::error::ParseError<Stream, ContextError>> {
     let input = Stream::new(input);
-    trace(
-        "model",
-        terminated(repeat(0.., multi_ws(model_declaration)), eof),
-    )
+    repeat(0.., multi_ws(model_declaration))
     .context(StrContext::Label("model"))
-    .parse_next(&mut input.into())
+    .parse(input.into())
 }
 
 #[cfg(test)]
@@ -803,6 +736,60 @@ mod test {
         .unwrap();
         assert_eq!(result, vec!["lol", "lol2"]);
     }
+    #[test]
+    fn test_uniontype() {
+        let result = type_declartion(&mut Located::new("Int")).unwrap();
+        assert_eq!(result, UnionType(vec![Datatype::SingleType("Int")]));
+        let result = type_declartion(&mut Located::new("Int|String")).unwrap();
+        assert_eq!(result, UnionType(vec![Datatype::SingleType("Int"), Datatype::SingleType("String")]));
+        let result = type_declartion(&mut Located::new("Int | String")).unwrap();
+        assert_eq!(result, UnionType(vec![Datatype::SingleType("Int"), Datatype::SingleType("String")]));
+        let result = type_declartion(&mut Located::new("[Int]")).unwrap();
+        assert_eq!(result, UnionType(vec![Datatype::List(UnionType(vec![Datatype::SingleType("Int")]))]));
+        let result = type_declartion(&mut Located::new("[Int|String]")).unwrap();
+        assert_eq!(result, UnionType(vec![Datatype::List(UnionType(vec![Datatype::SingleType("Int"), Datatype::SingleType("String")]))]));
+        let result = type_declartion(&mut Located::new("[[Int|String]]")).unwrap();
+        assert_eq!(result, UnionType(
+                vec![
+                Datatype::List(
+                    UnionType(
+                        vec![
+                        Datatype::List(
+                            UnionType(
+                                vec![
+                                Datatype::SingleType("Int"),
+                                Datatype::SingleType("String")
+                                ]
+                                )
+                            )
+                        ]
+                        )
+                    )
+                ]
+                )
+            );
+        let result = type_declartion(&mut Located::new("[[Int|String] | Int]")).unwrap();
+        assert_eq!(result, UnionType(
+                vec![
+                Datatype::List(
+                    UnionType(
+                        vec![
+                        Datatype::List(
+                            UnionType(
+                                vec![
+                                Datatype::SingleType("Int"),
+                                Datatype::SingleType("String")
+                                ]
+                                )
+                            ),
+                            Datatype::SingleType("Int"),
+                        ]
+                        )
+                    )
+                ]
+                )
+            );
+    }
 
     #[test]
     fn test_class() {
@@ -822,17 +809,17 @@ mod test {
             assert_eq!(*super_type, None);
             assert_eq!(
                 members[0],
-                Member::Declaration {
+                ClassMember::Declaration {
                     name: "bool",
-                    datatype: "Bool",
+                    datatype: UnionType(vec![Datatype::SingleType("Bool")]),
                     doc_str: vec![]
                 }
             );
             assert_eq!(
                 members[1],
-                Member::Declaration {
+                ClassMember::Declaration {
                     name: "test",
-                    datatype: "String",
+                    datatype: UnionType(vec![Datatype::SingleType("String")]),
                     doc_str: vec![]
                 }
             );
@@ -855,7 +842,7 @@ mod test {
             assert_eq!(*super_type, None);
             assert_eq!(
                 members[0],
-                Member::Assignment {
+                ClassMember::Assignment {
                     name: "bool",
                     value: MemberValue::Const(Constant::Bool(true)),
                     doc_str: vec![]
@@ -863,9 +850,9 @@ mod test {
             );
             assert_eq!(
                 members[1],
-                Member::Declaration {
+                ClassMember::Declaration {
                     name: "test",
-                    datatype: "String",
+                    datatype: UnionType(vec![Datatype::SingleType("String")]),
                     doc_str: vec![]
                 }
             );
@@ -885,9 +872,9 @@ mod test {
             assert_eq!(*super_type, Some("Super"));
             assert_eq!(
                 members[0],
-                Member::Declaration {
+                ClassMember::Declaration {
                     name: "bool",
-                    datatype: "Bool",
+                    datatype: UnionType(vec![Datatype::SingleType("Bool")]),
                     doc_str: vec![]
                 }
             );
@@ -1023,17 +1010,17 @@ module MQTT {
             assert_eq!(*super_type, None);
             assert_eq!(
                 members[0],
-                Member::Declaration {
+                ClassMember::Declaration {
                     name: "sensitivity",
-                    datatype: "Int",
+                    datatype: UnionType(vec![Datatype::SingleType("Int")]),
                     doc_str: vec![]
                 }
             );
             assert_eq!(
                 members[1],
-                Member::Declaration {
+                ClassMember::Declaration {
                     name: "format",
-                    datatype: "Atom",
+                    datatype: UnionType(vec![Datatype::SingleType("Atom")]),
                     doc_str: vec![]
                 }
             );

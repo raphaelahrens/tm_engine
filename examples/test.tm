@@ -1,5 +1,3 @@
-import dfd
-
 enum Boundary {
     # Internet
     Internet,
@@ -9,12 +7,9 @@ enum Boundary {
     VPC,
 }
 
-enum Classification {
-    TOP_SECRET,
-    SECRET,
-    RESTRICTED,
-    PUBLIC,
-}
+import dfd
+import web
+import db
 
 # User
 user = Actor{
@@ -33,13 +28,12 @@ web = Server{
 }
 #sourceFiles = ["pytm/json.py", "docs/template.md"]
 
-
 # SQL Database
 db = Datastore {
     OS = "CentOS",
     controls = Controls{
         isHardened = true,
-    }
+    },
     inBoundary = Boundary.ServerDB,
     type = DatastoreType.SQL,
     inScope = true,
@@ -50,8 +44,8 @@ secretDb = Datastore{
     OS = "CentOS",
     controls = Controls{
         isHardened = true,
-    }
-    inBoundary = server_db,
+    },
+    inBoundary = Boundary.ServerDB,
     type = DatastoreType.SQL,
     inScope = true,
     storesPII = true,
@@ -61,21 +55,22 @@ secretDb = Datastore{
 
 # AWS Lambda
 my_lambda = Lambda{
-    controls.hasAccessControl = true,
-    inBoundary = vpc,
+    controls= Controls{
+        hasAccessControl = true,
+    },
+    inBoundary = Boundary.VPC,
 }
 
 # Database verify real user identity
 # note : Verifying that the user is who they say they are.
 db -> secretDb = Flow{ 
-                     protocol = "RDA-TCP",
-                     dstPort = 40234,
-                     # Token verifying user identity
-                     data = Data{
-                         classification=Classification.SECRET,
-                     },
-                     maxClassification = Classification.SECRET,
-                 }
+    protocol = "RDA-TCP",
+    dstPort = 40234,
+    # Token verifying user identity
+    data = Data{
+        classification = Classification.SECRET,
+    },
+}
 
 # Comment sequence
 #
@@ -84,13 +79,9 @@ seq insert_comment {
     # User enters comments
     # note: This is a simple web app
     # that stores and retrieves user comments.
-    user -> web = Flow{
-        protocol = "HTTP",
-        dstPort = 80,
+    user -> web = HttpGet{
         # Comments in HTML or Markdown
-        data = Data{
-            classification=Classification.PUBLIC
-        },
+        data = Data{},
     }
 
     #  Insert query with comments)
@@ -100,51 +91,35 @@ seq insert_comment {
         protocol = "MySQL",
         dstPort = 3306,
         # Insert query with comments, 
-        data = Data{
-            classification=Classification.PUBLIC
-        },
-    )
+        data = Data{},
+    }
 
-    comment_retrieved = Data(
-        "Web server retrieves comments from DB", classification=Classification.PUBLIC
-    )
     #  Retrieve comments
     db -> web = Flow {
         protocol = "MySQL",
         dstPort = 80,
         #Web server retrieves comments from DB 
-        data = Data{
-            classification=Classification.PUBLIC
-        }
-        responseTo = web_to_db
-
+        data = Data{},
+    }
     # Show comments
-    web -> user = Flow {
-        protocol = "HTTP".
+    web -> user = HttpReply {
         # Web server shows comments to the end user
-        data = Data{
-            classifcation=Classification.PUBLIC
-        }
-        responseTo = user_to_web
+        data = Data{},
     }
 }
 
 # Serverless function periodically cleans DB
 my_lambda -> db = Flow {
-    protocol = "MySQL"
-    dstPort = 3306
+    protocol = "MySQL",
+    dstPort = 3306,
     #Serverless function clears DB
-    data = Data{
-        classification=Classification.PUBLIC,
-    }
+    data = Data{},
 }
 
-# User Id Token
-#
-# Some unique token that represents the user real data in the secret database
-userIdToken = Data(
-    name="User ID Token",
-    classification=Classification.TOP_SECRET,
-)
-# traverses=[user_to_web, db_to_secretDb],
-# processedBy=[db, secretDb],
+type Some {
+    a: [Int]
+}
+
+a = Some {
+    a = [1]
+}

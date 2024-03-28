@@ -1,19 +1,6 @@
 use std::{
-    collections::{btree_map::Entry, BTreeMap, BTreeSet},
-    fs::File,
-    io::Read,
-    path::{Path, PathBuf},
+    collections::{btree_map::Entry, BTreeMap, BTreeSet}, fs::File, io::Read, path::{Path, PathBuf}
 };
-
-use thiserror::Error;
-mod algo;
-mod interpreter;
-pub mod parser;
-mod types;
-
-pub use interpreter::{Decision, ExecutionError, Reason};
-
-pub use parser::Stream;
 
 use petgraph::{
     graph::{EdgeIndex, NodeIndex},
@@ -23,7 +10,20 @@ use petgraph::{
 
 use fixedbitset::FixedBitSet;
 
-use self::parser::{Constant, Member, MemberValue, Node, ObjectMember};
+use thiserror::Error;
+use line_span::LineSpanExt;
+
+mod algo;
+mod interpreter;
+pub mod parser;
+mod types;
+
+pub use interpreter::{Decision, ExecutionError, Reason};
+
+pub use parser::Stream;
+
+
+use self::{parser::{ClassMember, Constant, Datatype, MemberValue, Node, ObjectMember}, types::UnionType};
 
 const EXTENSION: &str = "tm";
 
@@ -46,13 +46,17 @@ pub struct ParserErrorItem {
     pub error: winnow::error::ErrorKind,
 }
 
+fn get_line_from_offset(source_code: &str, offset:usize) -> &str{
+        &source_code[source_code.find_line_range(offset)]
+}
+
 #[derive(Error, Debug)]
 pub enum CompileError {
     #[error("Type miss match")]
     TypeError(#[from] types::TypeError),
-    #[error("Type miss match")]
+    #[error("Class miss match")]
     ClassError(#[from] types::ClassError),
-    #[error("Type miss match")]
+    #[error("IO Error")]
     IoError(#[from] std::io::Error),
     #[error("The assignt member has been redefined.")]
     RedefinedMember,
@@ -66,25 +70,28 @@ pub enum CompileError {
     UndefinedMember {
         missing_members: Vec<(String, String)>,
     },
+    #[error("This code shoudl be Unreachable. Reason:\n {0}")]
+    Unreachable(&'static str),
     #[error("Strange module name.")]
     StrangeModule,
     #[error("Can not find module")]
     ModuleNotFound,
-    #[error("Parsing error {0:?}")]
-    ParseError(winnow::error::ErrMode<winnow::error::ContextError>),
-}
-impl From<winnow::error::ErrMode<winnow::error::ContextError>> for CompileError {
-    fn from(sub: winnow::error::ErrMode<winnow::error::ContextError>) -> Self {
-        CompileError::ParseError(sub)
-    }
+    #[error("Parsing error {context:?}\n\n\t {}", get_line_from_offset(.source_code, *.offset))
+    ]
+    ParseError{
+        context: winnow::error::ContextError,
+        offset: usize,
+        source_code: String
+    },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Bool(bool),
     Int(i64),
     Str(Str),
-    EnumValue(Str),
+    List(Vec<Value>),
+    EnumValue(types::EnumRef, Str),
     Object(ValueTree),
 }
 
@@ -101,15 +108,19 @@ impl Value {
     fn str(value: &str) -> Self {
         Value::Str(value.into())
     }
-    fn enum_value(value: &str) -> Self {
-        Value::EnumValue(value.into())
+    fn list(value: &[Constant]) -> Self {
+        Value::List(value.iter().map(|c| Value::from(c)).collect())
+    }
+    fn enum_value(enum_type: types::EnumRef,value: &str) -> Self {
+        Value::EnumValue(enum_type, value.into())
     }
     fn get_type(&self) -> types::Type {
         match self {
             Self::Bool(_) => types::Type::Bool,
             Self::Int(_) => types::Type::Int,
             Self::Str(_) => types::Type::Str,
-            Self::EnumValue(_) => types::Type::Enum,
+            Self::List(values) => types::Type::List(UnionType::new(values.iter().map(|v| v.get_type()).collect())),
+            Self::EnumValue(enum_type, ..) => types::Type::Enum(enum_type.clone()),
             Self::Object(value_tree) => types::Type::Class(value_tree.datatype.clone()),
         }
     }
@@ -137,16 +148,16 @@ impl From<String> for Value {
 }
 impl From<&Constant<'_>> for Value {
     fn from(item: &Constant) -> Self {
-        match *item {
-            Constant::Bool(b) => Value::bool(b),
+        match item {
+            Constant::Bool(b) => Value::bool(*b),
             Constant::Str(v) => Value::str(v),
-            Constant::Int(v) => Value::int(v),
-            Constant::EnumValue(v) => Value::enum_value(v),
+            Constant::Int(v) => Value::int(*v),
+            Constant::List(v) => Value::list(&v),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ValueTree {
     tree: BTreeMap<Str, Value>,
     pub datatype: types::ClassRef,
@@ -259,17 +270,30 @@ impl ModelCompiler {
             path,
         }
     }
-    fn get_type(&self, name: &str) -> Result<types::Type, CompileError> {
+    fn get_type_from_name(&self,name: &str) -> Result<types::Type, CompileError> {
         match name {
             "Bool" => Ok(types::Type::Bool),
             "Int" => Ok(types::Type::Int),
             "String" => Ok(types::Type::Str),
-            "Object" => Ok(types::Type::Object),
             name => {
-                let cls = self.types.get_class(name)?;
-                Ok(types::Type::Class(cls.clone()))
+                Ok(self.types.get_type(name)?)
             }
         }
+    }
+    fn get_type(&self, datatype: &parser::UnionType) -> Result<types::UnionType, CompileError> {
+        let inner_types:Result<Vec<_>, CompileError> = datatype.iter().map(|dt| {
+            match dt {
+                // Class, Enum, String, Int, Bool
+                Datatype::SingleType(name) => {
+                    self.get_type_from_name(name)
+                },
+                Datatype::List(list_type) => {
+                    Ok(types::Type::List(self.get_type(list_type)?))
+                }
+            }
+        }
+        ).collect();
+        Ok(types::UnionType::new(inner_types?))
     }
 
     fn value(&self, value: &MemberValue) -> Result<Value, CompileError> {
@@ -284,6 +308,12 @@ impl ModelCompiler {
                 }
                 Ok(Value::Object(object))
             }
+            MemberValue::Enum{datatype, value }=>{
+                let datatype: Vec<String> = datatype.iter().map(|s|s.to_string()).collect();
+                let datatype = datatype.join(".");
+                let datatype = self.types.get_enum(&datatype)?;
+                Ok(Value::enum_value(datatype.clone(), value))
+            },
             MemberValue::Const(c) => Ok(c.into()),
         }
     }
@@ -305,7 +335,7 @@ impl ModelCompiler {
                     };
                     for m in members {
                         match m {
-                            Member::Declaration {
+                            ClassMember::Declaration {
                                 name,
                                 datatype,
                                 doc_str: _,
@@ -313,7 +343,7 @@ impl ModelCompiler {
                                 let datatype = self.get_type(datatype)?;
                                 new_class.add_member(name, datatype)?;
                             }
-                            Member::Assignment {
+                            ClassMember::Assignment {
                                 name,
                                 value,
                                 doc_str: _,
@@ -336,7 +366,7 @@ impl ModelCompiler {
                             return Err(CompileError::RedefinedEnumVariants);
                         }
                     }
-                    let new_enum = types::Enum { variants };
+                    let new_enum = types::Enum::new(name, variants);
                     self.types.add_enum(name, new_enum)?;
                 }
                 Node::Element {
@@ -374,12 +404,13 @@ impl ModelCompiler {
                     todo!();
                 }
                 Node::Import { name } => {
-                    let module_name = if let Some(n) = name.split('.').next() {
-                        let mut path = PathBuf::from(n);
+                    let module_name = {
+                        let mut path = PathBuf::from(".");
+                        for n in name {
+                            path.push(n);
+                        }
                         path.set_extension(EXTENSION);
                         path
-                    } else {
-                        return Err(CompileError::StrangeModule);
                     };
                     let mut candidates = self
                         .path
@@ -391,6 +422,8 @@ impl ModelCompiler {
                     } else {
                         return Err(CompileError::ModuleNotFound);
                     }
+                }
+                Node::Comment(_lines) => {
                 }
             }
         }
@@ -448,7 +481,17 @@ impl ModelCompiler {
 
         let mut model_str = String::new();
         file.read_to_string(&mut model_str)?;
-        let ast = parser::parse_model(&model_str)?;
+        let ast = match parser::parse_model(&model_str){
+            Ok(ok) => ok,
+            Err(e) => {
+                let e = CompileError::ParseError{
+                    offset: e.offset(),
+                    context:e.into_inner(),
+                    source_code: model_str,
+                };
+                return Err(e);
+            }
+        };
 
         self.compile(&ast)?;
         Ok(())
@@ -509,7 +552,7 @@ impl QueryGraphBuilder {
     }
 }
 
-pub struct QElement(parser::Query);
+pub struct QElement(interpreter::Query);
 
 impl QElement {
     fn new(query: &str) -> Result<Self, RunError> {
@@ -517,7 +560,7 @@ impl QElement {
         Ok(Self(query))
     }
 }
-pub struct QFlow(parser::Query);
+pub struct QFlow(interpreter::Query);
 impl QFlow {
     pub fn new(query: &str) -> Result<Self, RunError> {
         let query = parser::parse_query(query)?;
@@ -530,38 +573,41 @@ mod test {
     use super::*;
 
     fn create_model() -> Model {
-        let ast = parser::parse_model(
+        let source_code = 
             "
-                            type Client {
-                                bool: Bool,
-                                client: Bool,
-                                str: String,
-                            }
-                            type Server {
-                                bool: Bool,
-                                server: Bool,
-                            }
-                            client = Client {
-                                bool = true,
-                                client = true,
-                                str = \"test\",
-                            }
-                            server = Server {
-                                bool = true,
-                                server = true,
-                            }
-
-                            type Dummy { }
-
-                            other = Dummy {}
-                            
-                            # request login
-                            client -> server = Dummy{ }
-                            # login result
-                            server -> client = Dummy{ }
-                            ",
-        )
-        .unwrap();
+            type Client {
+                bool: Bool,
+                client: Bool,
+                str: String,
+            }
+            type Server {
+                bool: Bool,
+                server: Bool,
+            }
+            client = Client {
+                bool = true,
+                client = true,
+                str = \"test\",
+            }
+            server = Server {
+                bool = true,
+                server = true,
+            }
+            type Dummy {}
+            other = Dummy {}
+            client -> server = Dummy{}
+            server -> client = Dummy{}";
+        let ast = parser::parse_model(
+            source_code
+        );
+        let ast = match ast {
+            Ok(ast) => ast,
+            Err(e) => {
+                dbg!(get_line_from_offset(source_code, e.offset()));
+                panic!();
+            }
+        };
+        
         let mut model = ModelCompiler::new(vec![]);
         model.compile(&ast).unwrap();
         model.build()
