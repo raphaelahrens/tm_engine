@@ -119,7 +119,7 @@ impl Value {
             Self::Bool(_) => types::Type::Bool,
             Self::Int(_) => types::Type::Int,
             Self::Str(_) => types::Type::Str,
-            Self::List(values) => types::Type::List(UnionType::new(values.iter().map(|v| v.get_type()).collect())),
+            Self::List(values) => types::Type::List(UnionType::from_vec(values.iter().map(|v| v.get_type()).collect())),
             Self::EnumValue(enum_type, ..) => types::Type::Enum(enum_type.clone()),
             Self::Object(value_tree) => types::Type::Class(value_tree.datatype.clone()),
         }
@@ -293,7 +293,7 @@ impl ModelCompiler {
             }
         }
         ).collect();
-        Ok(types::UnionType::new(inner_types?))
+        Ok(types::UnionType::from_vec(inner_types?))
     }
 
     fn value(&self, value: &MemberValue) -> Result<Value, CompileError> {

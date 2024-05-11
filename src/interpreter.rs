@@ -518,16 +518,16 @@ mod test {
     #[test]
     fn test_member() {
         let mut b = Class::new("b");
-        b.add_member("c", UnionType::new(vec![Type::Bool])).unwrap();
-        b.add_member("d", UnionType::new(vec![Type::Int])).unwrap();
+        b.add_member("c", UnionType::from_vec(vec![Type::Bool])).unwrap();
+        b.add_member("d", UnionType::from_vec(vec![Type::Int])).unwrap();
         let b = Rc::new(b);
         let mut a = Class::new("a");
-        a.add_member("b", UnionType::new(vec![Type::Class(b.clone())])).unwrap();
+        a.add_member("b", UnionType::from_vec(vec![Type::Class(b.clone())])).unwrap();
         let a = Rc::new(a);
 
         let mut new_class = Class::new("new_class");
-        new_class.add_member("a", UnionType::new(vec![Type::Class(a.clone())])).unwrap();
-        new_class.add_member("test", UnionType::new(vec![Type::Bool])).unwrap();
+        new_class.add_member("a", UnionType::from_vec(vec![Type::Class(a.clone())])).unwrap();
+        new_class.add_member("test", UnionType::from_vec(vec![Type::Bool])).unwrap();
         let new_class = Rc::new(new_class);
 
         let mut b_value = ValueTree::new(b);
@@ -552,13 +552,13 @@ mod test {
     #[test]
     fn test_in_op() {
         let mut new_class = Class::new("new_class");
-        new_class.add_member("list", UnionType::new(vec![Type::List(UnionType::new(vec![Type::Int]))])).unwrap();
-        new_class.add_member("list2", UnionType::new(vec![Type::List(UnionType::new(vec![Type::Int]))])).unwrap();
+        new_class.add_member("list", UnionType::from_vec(vec![Type::List(UnionType::from_vec(vec![Type::Int]))])).unwrap();
+        new_class.add_member("list2", UnionType::from_vec(vec![Type::List(UnionType::from_vec(vec![Type::Int]))])).unwrap();
         let new_class = Rc::new(new_class);
 
         let mut vt = ValueTree::new(new_class);
         vt.insert("list", Value::List(vec![Value::int(4)])).unwrap();
-        vt.insert("list", Value::List(vec![Value::int(8), Value::int(4), Value::int(10), Value::int(7), Value::int(13), Value::int(40), Value::int(5)])).unwrap();
+        vt.insert("list2", Value::List(vec![Value::int(8), Value::int(4), Value::int(10), Value::int(7), Value::int(13), Value::int(40), Value::int(5)])).unwrap();
 
         let code = parse_query("4 in .list").unwrap();
         assert_eq!(execute(&code, &vt), Ok(Decision::Match));

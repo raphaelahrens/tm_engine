@@ -1,12 +1,12 @@
 use petgraph::{
     graph::{Graph, NodeIndex, NodeIndices},
-    visit::{EdgeRef, GetAdjacencyMatrix},
+    visit::{GetAdjacencyMatrix, EdgeRef},
     Direction,
 };
 use std::collections::HashSet;
 use std::iter::Peekable;
 
-use crate::{interpreter, Element, Model, QElement, QueryGraph};
+use crate::{interpreter, Element, Model, threat::{QElement, QueryGraph},};
 
 fn cmp_weights(query: Option<&QElement>, model: Option<&Element>) -> bool {
     match (query, model) {
@@ -175,7 +175,7 @@ mod test {
     use crate::{
         parser::parse_model,
         types::{Class, ClassRef},
-        Flow, ModelCompiler, QFlow, QueryGraphBuilder,
+        Flow, ModelCompiler, threat::{QFlow, QueryGraphBuilder},
     };
 
     use super::*;
