@@ -9,7 +9,7 @@ keywords:
 
 Some elments or flow make use of a specific technologie like JSON, nginx, HTTP, ...
 
-Each have there own set of possible findings, an as soon as one technology is used these should be applied to the threat model.
+Each have there own set of possible findings and as soon as one technology is used these should be applied to the threat model.
 
 # Example findings
 

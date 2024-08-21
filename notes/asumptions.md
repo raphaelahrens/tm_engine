@@ -9,7 +9,7 @@ followups:
   - remarks.md
 ---
 
-Assumtions are have to be noted in some form
+Assumtions have to be noted in some form
 
 Either as part of a finding or as a seperate opbject.
 
