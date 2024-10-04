@@ -1,6 +1,7 @@
 use std::fmt;
+use crate::types::EnumRef;
 use crate::{
-    Value, ValueTree,
+    Value, ValueTree, Str,
 };
 use thiserror::Error;
 
@@ -17,10 +18,10 @@ pub enum ExecutionError {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Operation {
     Bool(bool),
-    Str(Box<str>),
+    Str(Str),
     Int(i64),
-    EnumValue(Box<str>),
-    Member { name: Box<str>, pos: usize },
+    EnumValue(EnumRef, Str),
+    Member { name: Str, pos: usize },
     Not,
     Greater,
     GreaterEq,
@@ -50,7 +51,7 @@ impl Operation {
             Self::Bool(true) => '1',
             Self::Str(_) => '"',
             Self::Int(_) => '#',
-            Self::EnumValue(_) => 'E',
+            Self::EnumValue(..) => 'E',
             Self::Member { name, .. } => {
                 let mut iter = name.chars().skip(1);
                 match iter.next() {
@@ -61,11 +62,18 @@ impl Operation {
         }
     }
 }
+/**
+ * A [Query] is a list of bytescode operations, which when executed with [execute] retruns true if a given
+ * [ValueTree] matches this [Query].
+ */
 #[derive(PartialEq)]
 pub struct Query {
-    pub ops: Box<[Operation]>,
-    pub false_jumps: Box<[usize]>,
-    pub true_jumps: Box<[usize]>,
+    //TODO: Maybe this could be a single value holding both jumps and the operation.
+    ops: Box<[Operation]>,
+    /// A list of length `ops` indicating where to jump if an operation returned `false`
+    false_jumps: Box<[usize]>,
+    /// A list of length `ops` indicating where to jump if an operation returned `true`
+    true_jumps: Box<[usize]>,
 }
 
 fn set_jump(ops: &[Operation], false_jumps: &mut Vec<usize>, index: usize, argn: usize) {
@@ -142,6 +150,9 @@ impl fmt::Debug for Query {
     }
 }
 
+/**
+ * An iterator of a query returning the operation, false jump position and the true jump position.
+ */
 pub struct QueryIter<'query> {
     query: &'query Query,
     next: usize,
@@ -159,8 +170,6 @@ impl<'query> Iterator for QueryIter<'query> {
 
         self.next = current + 1;
 
-        // Since there's no endpoint to a Fibonacci sequence, the `Iterator`
-        // will never return `None`, and `Some` is always returned.
         Some((op, *false_jump, *true_jump))
     }
 }
@@ -171,10 +180,11 @@ impl<'query> Iterator for QueryIter<'query> {
 #[derive(PartialEq, Debug)]
 enum StackValue<'object> {
     Bool(bool),
-    Str(&'object str),
     Int(i64),
+    Str(&'object str),
     Object(&'object ValueTree),
     List(&'object[Value]),
+    Enum(EnumRef, &'object str),
 }
 
 impl<'object> From<&'object Value> for StackValue<'object> {
@@ -184,7 +194,7 @@ impl<'object> From<&'object Value> for StackValue<'object> {
             Value::Str(v) => StackValue::Str(v),
             Value::Int(v) => StackValue::Int(*v),
             Value::List(values) => StackValue::List(values),
-            Value::EnumValue(..) => todo!(),
+            Value::EnumValue(e_ref, value) => StackValue::Enum(e_ref.clone(), &value),
             Value::Object(v) => StackValue::Object(v),
         }
     }
@@ -203,13 +213,23 @@ impl<'object> PartialEq<Value> for StackValue<'object> {
     }
 }
 
+/**
+ * The reason why a [execute] call resulted in a difference.
+ */
 #[derive(Debug, PartialEq)]
 pub enum Reason {
+    /// The query was no match
     Unequal,
+    /// A type did not match the expected type
     TypeDifference,
+    /// A member used in the query was not set in the [ValueTree].
+    // TODO:: Maybe this can be removed once the types are properly checked.
     UnsetMember,
 }
 
+/**
+ * The result of a [execute] call.
+ */
 #[derive(Debug, PartialEq)]
 pub enum Decision {
     Match,
@@ -247,8 +267,8 @@ pub fn execute(query: &Query, element: &ValueTree) -> Result<Decision, Execution
             Operation::Str(value) => {
                 stack.push(StackValue::Str(value));
             }
-            Operation::EnumValue(_value) => {
-                todo!("");
+            Operation::EnumValue(enum_t, value) => {
+                stack.push(StackValue::Enum(enum_t.clone(), value));
             }
             Operation::Member { name: path, pos: p } => match element.get(path) {
                 Some(value) => {
@@ -442,13 +462,18 @@ mod test {
     use std::rc::Rc;
 
     use super::*;
-    use crate::parser::parse_query;
-    use crate::types::{Type, UnionType};
-    use crate::types::{Class, ClassRef};
+    use crate::parser::{parse_query, compile_query};
+    use crate::types::{Class, ClassRef, Type, TypeTable, UnionType};
     use crate::ValueTree;
+    use crate::interpreter::Query;
 
     fn obj() -> ClassRef {
         Rc::new(Class::new("obj"))
+    }
+
+    fn compile(query: &str, types: &TypeTable) -> Query{
+        let code = parse_query(query).expect("tql");
+        compile_query(code, &types).expect("succesful compilation")
     }
 
     #[test]
@@ -463,32 +488,38 @@ mod test {
     }
     #[test]
     fn test_parser() {
-        let code = parse_query("true").unwrap();
+        let types = TypeTable::new();
+        let code = compile("true", &types);
         assert_eq!(execute(&code, &ValueTree::new(obj())), Ok(Decision::Match));
     }
     #[test]
     fn test_eq() {
-        let code = parse_query("true == true").unwrap();
+        let types = TypeTable::new();
+        let code = compile("true == true", &types);
         assert_eq!(execute(&code, &ValueTree::new(obj())), Ok(Decision::Match));
     }
     #[test]
     fn test_noteq() {
-        let code = parse_query("false != true").unwrap();
+        let types = TypeTable::new();
+        let code = compile("false != true", &types);
         assert_eq!(execute(&code, &ValueTree::new(obj())), Ok(Decision::Match));
     }
     #[test]
     fn test_gteq() {
-        let code = parse_query("60 >= 4").unwrap();
+        let types = TypeTable::new();
+        let code = compile("60 >= 4", &types);
         assert_eq!(execute(&code, &ValueTree::new(obj())), Ok(Decision::Match));
     }
     #[test]
     fn test_gt() {
-        let code = parse_query("60 > 4").unwrap();
+        let types = TypeTable::new();
+        let code = compile("60 > 4", &types);
         assert_eq!(execute(&code, &ValueTree::new(obj())), Ok(Decision::Match));
     }
     #[test]
     fn test_lt() {
-        let code = parse_query("60 < 4").unwrap();
+        let types = TypeTable::new();
+        let code = compile("60 < 4", &types);
         assert_eq!(
             execute(&code, &ValueTree::new(obj())),
             Ok(Decision::Difference(Reason::Unequal))
@@ -496,7 +527,8 @@ mod test {
     }
     #[test]
     fn test_lteq() {
-        let code = parse_query("60 <= 4").unwrap();
+        let types = TypeTable::new();
+        let code = compile("60 <= 4", &types);
         assert_eq!(
             execute(&code, &ValueTree::new(obj())),
             Ok(Decision::Difference(Reason::Unequal))
@@ -504,7 +536,8 @@ mod test {
     }
     #[test]
     fn test_and() {
-        let code = parse_query("60 <= 4 and true").unwrap();
+        let types = TypeTable::new();
+        let code = compile("60 <= 4 and true", &types);
         assert_eq!(
             execute(&code, &ValueTree::new(obj())),
             Ok(Decision::Difference(Reason::Unequal))
@@ -512,11 +545,13 @@ mod test {
     }
     #[test]
     fn test_or() {
-        let code = parse_query("60 <= 4 and true or true").unwrap();
+        let types = TypeTable::new();
+        let code = compile("60 <= 4 and true or true", &types);
         assert_eq!(execute(&code, &ValueTree::new(obj())), Ok(Decision::Match));
     }
     #[test]
     fn test_member() {
+        let types = TypeTable::new();
         let mut b = Class::new("b");
         b.add_member("c", UnionType::from_vec(vec![Type::Bool])).unwrap();
         b.add_member("d", UnionType::from_vec(vec![Type::Int])).unwrap();
@@ -540,17 +575,18 @@ mod test {
         vt.insert("test", Value::Bool(true)).unwrap();
         vt.insert("a", Value::Object(a_value)).unwrap();
 
-        let code = parse_query(".test").unwrap();
+        let code = compile(".test", &types);
         assert_eq!(execute(&code, &vt), Ok(Decision::Match));
-        let code = parse_query(".test and .a.b.c").unwrap();
+        let code = compile(".test and .a.b.c", &types);
         assert_eq!(execute(&code, &vt), Ok(Decision::Match));
-        let code = parse_query(".test and .a.b.d == 10").unwrap();
+        let code = compile(".test and .a.b.d == 10", &types);
         assert_eq!(execute(&code, &vt), Ok(Decision::Match));
-        let code = parse_query(".test or .a.b.c ").unwrap();
+        let code = compile(".test or .a.b.c ", &types);
         assert_eq!(execute(&code, &vt), Ok(Decision::Match));
     }
     #[test]
     fn test_in_op() {
+        let types = TypeTable::new();
         let mut new_class = Class::new("new_class");
         new_class.add_member("list", UnionType::from_vec(vec![Type::List(UnionType::from_vec(vec![Type::Int]))])).unwrap();
         new_class.add_member("list2", UnionType::from_vec(vec![Type::List(UnionType::from_vec(vec![Type::Int]))])).unwrap();
@@ -560,9 +596,9 @@ mod test {
         vt.insert("list", Value::List(vec![Value::int(4)])).unwrap();
         vt.insert("list2", Value::List(vec![Value::int(8), Value::int(4), Value::int(10), Value::int(7), Value::int(13), Value::int(40), Value::int(5)])).unwrap();
 
-        let code = parse_query("4 in .list").unwrap();
+        let code = compile("4 in .list", &types);
         assert_eq!(execute(&code, &vt), Ok(Decision::Match));
-        let code = parse_query("5 in .list2").unwrap();
+        let code = compile("5 in .list2", &types);
         assert_eq!(execute(&code, &vt), Ok(Decision::Match));
     }
 }

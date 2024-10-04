@@ -26,3 +26,5 @@ seq1 = Sequence(
 ```
 
 The advantage of modelling this in a Sequnece is that a threat beginning in one dataflow of the Sequence is affecting all following dataflows.
+Which then can be better visualized.
+A threat inside a sequence has can be influenced by the preceding and succeeding flows.

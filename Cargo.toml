@@ -12,11 +12,13 @@ petgraph = "0.6"
 winnow = "0.6"
 line-span = "0.1"
 thiserror = "1.0"
-itertools = "0.12"
+itertools = "0.13"
 fixedbitset ="0.4.2"
 clap = { version = "4.5", features = ["derive"] }
 eyre = "0.6"
-threatmd = { version="0.1", git ="https://github.com/raphaelahrens/threatmd"}
+threatmd = { version="0.1", git="https://github.com/raphaelahrens/threatmd"}
+serde = {version="1.0", features=["derive"]}
+toml = "0.8"
 [dev-dependencies]
 
 #winnow = {version = "0.6", features=["std", "debug"]}

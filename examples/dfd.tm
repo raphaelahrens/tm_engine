@@ -20,6 +20,7 @@ type Data {
     classification=Classification.PUBLIC,
 }
 
+# A dataflow 
 type Flow {
         protocol:String,
         dstPort:Int,

@@ -8,26 +8,51 @@ use std::iter::Peekable;
 
 use crate::{interpreter, Element, Model, threat::{QElement, QueryGraph},};
 
+/**
+ * Function for comparing the weights of an [QElement] and an [Element].
+ *
+ * For the comparison [interpreter::execute] is used.
+ */
 fn cmp_weights(query: Option<&QElement>, model: Option<&Element>) -> bool {
     match (query, model) {
         (Some(q_weigth), Some(m_weight)) => interpreter::execute(&q_weigth.0, &m_weight.0)
-            .unwrap()
+            .unwrap() // TODO: find a way to remove the unwrap better use match
             .into(),
         _ => false,
     }
 }
 
+/**
+ * Given a `graph` and a `node` this function return the number of
+ * edges which are connected to the `node` in the given `direction`.
+ */
 fn degree<N, E>(graph: &Graph<N, E>, node: NodeIndex, direction: Direction) -> usize {
     graph.neighbors_directed(node, direction).count()
 }
 
+/**
+ * Given a `graph` and a `node` this function return the number of
+ * edges which are going to the `node`.
+ */
 fn indegree<N, E>(graph: &Graph<N, E>, node: NodeIndex) -> usize {
     degree(graph, node, Direction::Incoming)
 }
+/**
+ * Given a `graph` and a `node` this function return the number of
+ * edges which are going out of the `node`.
+ */
 fn outdegree<N, E>(graph: &Graph<N, E>, node: NodeIndex) -> usize {
     degree(graph, node, Direction::Outgoing)
 }
 
+/**
+ * Find all the sub graphs of `model` which are isomorphic to the [QueryGraph] `query`.
+ *
+ * A sub graph of `model` is isomorphic to the `query` graph if there a one to one mapping for each
+ * not of the query graph to the nodes of the sub graph.
+ *
+ * It is possible to have mutiple mappings.
+ */
 pub fn subgraph_isomorphism(query: &QueryGraph, model: &Model) -> Vec<Vec<NodeIndex>> {
     let mut mapping: Vec<Option<NodeIndex>> = vec![None; query.graph.node_count()];
     let mut all_mappings: Vec<Vec<NodeIndex>> = Vec::new();
@@ -130,7 +155,6 @@ fn refine_subgraph_isomorphism(
                 candidates[x_qnode.index()].remove(&y_mnode);
             } else {
                 if !model.graph.edges_connecting(y_mnode, w_mnode).any(|e| {
-                    dbg!(&e.weight());
                     interpreter::execute(&e_qedge.weight().0, &e.weight().0)
                         .unwrap()
                         .into()
@@ -150,9 +174,8 @@ fn refine_subgraph_isomorphism(
                 candidates[x_qnode.index()].remove(&y_mnode);
             } else {
                 if !model.graph.edges_connecting(w_mnode, y_mnode).any(|e| {
-                    dbg!(&e.weight());
                     interpreter::execute(&e_qedge.weight().0, &e.weight().0)
-                        .unwrap()
+                        .unwrap() //TODO: remove this unwrap
                         .into()
                 }) {
                     candidates[x_qnode.index()].remove(&y_mnode);
@@ -175,7 +198,7 @@ mod test {
     use crate::{
         parser::parse_model,
         types::{Class, ClassRef},
-        Flow, ModelCompiler, threat::{QFlow, QueryGraphBuilder},
+        Flow, ModelCompiler,
     };
 
     use super::*;
@@ -230,10 +253,7 @@ mod test {
 
         let model = model.build();
 
-        let mut query = QueryGraphBuilder::new();
-        query.add(QElement::new("true").unwrap());
-
-        let query = query.build();
+        let query = QueryGraph::from_tql("p = P(true)", &model.types).unwrap();
 
         assert_eq!(
             subgraph_isomorphism(&query, &model),
@@ -247,13 +267,12 @@ mod test {
         let server = model.get_element("server").unwrap();
         let model = model.build();
 
-        let mut query = QueryGraphBuilder::new();
-        let s = query.add(QElement::new(".server").unwrap());
-        let c = query.add(QElement::new(".client").unwrap());
-        let _result_login = query.connect(c, s, QFlow::new("true").unwrap());
-        let _result_login = query.connect(s, c, QFlow::new("true").unwrap());
-
-        let query = query.build();
+        let query = QueryGraph::from_tql("
+            s = Server(.server)
+            c = Client(.client)
+            c -> s = Flow(true)
+            s -> c = Flow(true)
+            ", &model.types).unwrap();
 
         assert_eq!(
             subgraph_isomorphism(&query, &model),
@@ -263,24 +282,23 @@ mod test {
     #[test]
     fn test_subgraphisomorphism3() {
         let mut model = ModelCompiler::new(vec![]);
-        let client = model.add(Element::new(obj()));
-        let server = model.add(Element::new(obj()));
-        let other = model.add(Element::new(obj()));
+        let client = model.add_by_name("client", Element::new(obj())).unwrap();
+        let server = model.add_by_name("server", Element::new(obj())).unwrap();
+        let other = model.add_by_name("other", Element::new(obj())).unwrap();
 
         let _request_login = model.connect(client, server, Flow::new(obj()));
         let _result_login = model.connect(client, server, Flow::new(obj()));
         let _result_login2 = model.connect(server, client, Flow::new(obj()));
         let model = model.build();
 
-        let mut query = QueryGraphBuilder::new();
-        let s = query.add(QElement::new("true").unwrap());
-        let c = query.add(QElement::new("true").unwrap());
-        let _o = query.add(QElement::new("true").unwrap());
-        let _result_login = query.connect(c, s, QFlow::new("true").unwrap());
-        let _result_login = query.connect(c, s, QFlow::new("true").unwrap());
-
-        let query = query.build();
-
+        let query = QueryGraph::from_tql("
+            s = Server(true)
+            c = Client(true)
+            o = Other(true)
+            c -> s = Flow(true)
+            c -> s = Flow(true)
+            s -> c = Flow(true)
+            ", &model.types).unwrap();
         assert_eq!(
             subgraph_isomorphism(&query, &model),
             vec![vec![server, client, other]]
@@ -289,14 +307,14 @@ mod test {
     #[test]
     fn test_subgraphisomorphism4() {
         let mut model = ModelCompiler::new(vec![]);
-        let broker = model.add(Element::new(obj()));
-        let publisher = model.add(Element::new(obj()));
-        let c1 = model.add(Element::new(obj()));
-        let c2 = model.add(Element::new(obj()));
-        let c3 = model.add(Element::new(obj()));
-        let c4 = model.add(Element::new(obj()));
-        let c5 = model.add(Element::new(obj()));
-        let c6 = model.add(Element::new(obj()));
+        let broker = model.add_by_name("broker", Element::new(obj())).unwrap();
+        let publisher = model.add_by_name("publisher", Element::new(obj())).unwrap();
+        let c1 = model.add_by_name("c1", Element::new(obj())).unwrap();
+        let c2 = model.add_by_name("c2", Element::new(obj())).unwrap();
+        let c3 = model.add_by_name("c3", Element::new(obj())).unwrap();
+        let c4 = model.add_by_name("c4", Element::new(obj())).unwrap();
+        let c5 = model.add_by_name("c5", Element::new(obj())).unwrap();
+        let c6 = model.add_by_name("c7", Element::new(obj())).unwrap();
 
         model.connect(publisher, broker, Flow::new(obj()));
         model.connect(broker, c1, Flow::new(obj()));
@@ -308,16 +326,16 @@ mod test {
         model.connect(broker, c6, Flow::new(obj()));
         let model = model.build();
 
-        let mut query = QueryGraphBuilder::new();
-        let b = query.add(QElement::new("true").unwrap());
-        let p = query.add(QElement::new("true").unwrap());
-        let s = query.add(QElement::new("true").unwrap());
-        query.connect(p, b, QFlow::new("true").unwrap());
-        query.connect(b, s, QFlow::new("true").unwrap());
+        let query = QueryGraph::from_tql("
+            broker = A(true)
+            publisher = A(true)
+            subscriber = A(true)
 
-        let query = query.build();
+            publisher -> broker = A(true)
+            broker -> subscriber = A(true)
+            ", &model.types).unwrap();
 
-        assert_eq!(subgraph_isomorphism(&query, &model).len(), 6);
+        dbg!(&query);
         assert_eq!(
             subgraph_isomorphism(&query, &model),
             vec![

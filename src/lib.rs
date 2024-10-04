@@ -11,22 +11,29 @@ use petgraph::{
 use fixedbitset::FixedBitSet;
 
 use thiserror::Error;
-use line_span::LineSpanExt;
 
 mod algo;
 mod interpreter;
 pub mod parser;
 mod types;
+pub mod threat;
 
 pub use interpreter::{Decision, ExecutionError, Reason};
 
 pub use parser::Stream;
 
 
-use self::{parser::{ClassMember, Constant, Datatype, MemberValue, Node, ObjectMember}, types::UnionType};
+use self::{
+    parser::{
+        Constant,
+        types::Datatype,
+        model::{ClassMember, MemberValue, Node},
+    },
+    types::UnionType};
 
 const EXTENSION: &str = "tm";
 
+/// An unmutable owned string
 type Str = Box<str>;
 
 #[derive(Error, Debug, PartialEq)]
@@ -44,10 +51,6 @@ impl<'nom> From<winnow::error::ErrMode<winnow::error::ContextError>> for RunErro
 pub struct ParserErrorItem {
     pub input: String,
     pub error: winnow::error::ErrorKind,
-}
-
-fn get_line_from_offset(source_code: &str, offset:usize) -> &str{
-        &source_code[source_code.find_line_range(offset)]
 }
 
 #[derive(Error, Debug)]
@@ -76,15 +79,23 @@ pub enum CompileError {
     StrangeModule,
     #[error("Can not find module")]
     ModuleNotFound,
-    #[error("Parsing error {context:?}\n\n\t {}", get_line_from_offset(.source_code, *.offset))
+    #[error("Parsing error {context:?}\n\n\t {msg}",)
     ]
     ParseError{
         context: winnow::error::ContextError,
-        offset: usize,
-        source_code: String
+        msg: String
     },
 }
 
+/**
+ * A value in a model can either be a
+ *  * a bool,
+ *  * an integer,
+ *  * a string,
+ *  * a list of values,
+ *  * an enum, or 
+ *  * an object
+ */
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Bool(bool),
@@ -96,9 +107,6 @@ pub enum Value {
 }
 
 impl Value {
-    fn typed_object(datatype: types::ClassRef) -> Self {
-        Value::Object(ValueTree::new(datatype))
-    }
     fn bool(value: bool) -> Self {
         Value::Bool(value)
     }
@@ -157,6 +165,10 @@ impl From<&Constant<'_>> for Value {
     }
 }
 
+/**
+ * A ValueTree is basicaly an object.
+ */
+// TODO rename  this to object?
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValueTree {
     tree: BTreeMap<Str, Value>,
@@ -218,6 +230,9 @@ impl ValueTree {
     }
 }
 
+/**
+ * An [Element] is a node in the graph of the model, and it holds a [ValueTree].
+ */
 #[derive(Debug)]
 pub struct Element(ValueTree);
 
@@ -235,6 +250,9 @@ impl Element {
     }
 }
 
+/**
+ * A [Flow] is an ednge in the graph of the model, and it holds a [ValueTree] as its weight.
+ */
 #[derive(Debug)]
 pub struct Flow(ValueTree);
 
@@ -249,20 +267,27 @@ impl Flow {
         self.0.get(path)
     }
 }
-pub struct Finding {
-    threat: (),
-    nodes: Box<[NodeIndex]>,
-}
 
+/**
+ * A ModelCompiler is a mutable model which can be [ModelCompiler::build] into a [Model]
+ */
 #[derive(Debug)]
 pub struct ModelCompiler {
+    /// the graph which holds the model
     graph: Graph<Element, Flow>,
+    /// types are stored in a dictionary(table) index by name of the type 
     types: types::TypeTable,
+    /// Dictionary of elements names to nodes
     element_map: BTreeMap<Str, NodeIndex>,
+    /// Coolection of paths in which imports can be found
     path: Vec<PathBuf>,
 }
 impl ModelCompiler {
-    pub fn new(path: Vec<PathBuf>) -> Self {
+    /**
+     * Create a new model compiler with the collection of paths in `path`, where the imported files
+     * can be found.
+     */
+    fn new(path: Vec<PathBuf>) -> Self {
         Self {
             graph: Graph::new(),
             types: types::TypeTable::new(),
@@ -280,7 +305,7 @@ impl ModelCompiler {
             }
         }
     }
-    fn get_type(&self, datatype: &parser::UnionType) -> Result<types::UnionType, CompileError> {
+    fn get_type(&self, datatype: &parser::types::UnionType) -> Result<types::UnionType, CompileError> {
         let inner_types:Result<Vec<_>, CompileError> = datatype.iter().map(|dt| {
             match dt {
                 // Class, Enum, String, Int, Bool
@@ -318,8 +343,7 @@ impl ModelCompiler {
         }
     }
 
-    pub fn compile(&mut self, ast: &Vec<Node>) -> Result<(), CompileError> {
-        for node in ast {
+    fn compile_node(&mut self, node: &Node) -> Result<(), CompileError>{
             match node {
                 Node::Class {
                     name,
@@ -384,18 +408,17 @@ impl ModelCompiler {
                     element.0.check()?;
                     self.add_by_name(name, element)?;
                 }
-                Node::Flow {
-                    from,
-                    to,
-                    datatype,
-                    members,
-                    doc_str,
-                } => self.add_node_flow(from, to, datatype, members, doc_str)?,
+                Node::Flow(flow) => self.add_node_flow(flow)?,
                 Node::Sequence {
                     name: _,
-                    flows: _,
+                    flows,
                     doc_str: _,
-                } => {}
+                } => {
+                    //TODO: finish sequences
+                    for flow in flows{
+                        self.add_node_flow(flow)?;
+                    }
+                }
                 Node::Module {
                     name: _,
                     members: _,
@@ -426,23 +449,25 @@ impl ModelCompiler {
                 Node::Comment(_lines) => {
                 }
             }
+        Ok(())
+    }
+
+    fn compile_ast(&mut self, ast: &Vec<Node>) -> Result<(), CompileError> {
+        for node in ast {
+            self.compile_node(node)?;
         }
         Ok(())
     }
 
     fn add_node_flow(
         &mut self,
-        from: &str,
-        to: &str,
-        datatype: &str,
-        members: &Vec<ObjectMember>,
-        _doc_str: &Vec<&str>,
+        parsed_flow: &parser::model::Flow
     ) -> Result<(), CompileError> {
-        let from = self.get_element(from)?;
-        let to = self.get_element(to)?;
-        let classtype = self.types.get_class(datatype)?;
+        let from = self.get_element(parsed_flow.from)?;
+        let to = self.get_element(parsed_flow.to)?;
+        let classtype = self.types.get_class(parsed_flow.datatype)?;
         let mut flow = Flow::new(classtype.clone());
-        for member in members {
+        for member in &parsed_flow.members[..] {
             let member_value = self.value(&member.value)?;
             flow.insert(member.name, member_value)?;
         }
@@ -452,21 +477,18 @@ impl ModelCompiler {
         Ok(())
     }
 
-    fn add(&mut self, e: Element) -> NodeIndex {
-        self.graph.add_node(e)
-    }
-    fn add_by_name(&mut self, name: &str, e: Element) -> Result<(), CompileError> {
+    fn add_by_name(&mut self, name: &str, e: Element) -> Result<NodeIndex, CompileError> {
         let entry = self.element_map.entry(name.into());
         match entry {
             Entry::Occupied(_) => {
-                return Err(CompileError::RedefinedElement);
+                Err(CompileError::RedefinedElement)
             }
             Entry::Vacant(vacant_entry) => {
                 let idx = self.graph.add_node(e);
                 vacant_entry.insert(idx);
+                Ok(idx)
             }
         }
-        Ok(())
     }
     fn get_element(&self, name: &str) -> Result<NodeIndex, CompileError> {
         let idx = self
@@ -476,100 +498,71 @@ impl ModelCompiler {
         Ok(*idx)
     }
 
-    pub fn compile_file(&mut self, path: &Path) -> Result<(), CompileError> {
+    fn compile_file(&mut self, path: &Path) -> Result<(), CompileError> {
         let mut file = File::open(path)?;
 
         let mut model_str = String::new();
         file.read_to_string(&mut model_str)?;
-        let ast = match parser::parse_model(&model_str){
-            Ok(ok) => ok,
-            Err(e) => {
-                let e = CompileError::ParseError{
-                    offset: e.offset(),
+        let ast = parser::parse_model(&model_str).map_err(|e|{
+                let offset = e.offset();
+                CompileError::ParseError{
                     context:e.into_inner(),
-                    source_code: model_str,
-                };
-                return Err(e);
-            }
-        };
+                    msg: parser::get_line_from_offset(&model_str, offset).to_string()
+                }
+        })?;
 
-        self.compile(&ast)?;
+        self.compile_ast(&ast)?;
         Ok(())
     }
 
-    pub fn connect(&mut self, a: NodeIndex, b: NodeIndex, flow: Flow) -> EdgeIndex {
+    fn connect(&mut self, a: NodeIndex, b: NodeIndex, flow: Flow) -> EdgeIndex {
         self.graph.add_edge(a, b, flow)
     }
-    pub fn build(self) -> Model {
+    fn build(self) -> Model {
         let matrix = self.graph.adjacency_matrix();
         Model {
             graph: self.graph,
             adjance_matrix: matrix,
+            types: self.types,
+            element_map: self.element_map
         }
     }
 }
 
+/**
+ * A fully compiled model
+ */
 #[derive(Debug)]
 pub struct Model {
     pub graph: Graph<Element, Flow>,
     adjance_matrix: FixedBitSet,
+    pub types: types::TypeTable,
+    element_map: BTreeMap<Str, NodeIndex>,
 }
 
 impl Model {
-    pub fn query(&self, query: &QueryGraph) -> usize {
+    pub fn query(&self, query: &threat::QueryGraph) -> usize {
         let result = algo::subgraph_isomorphism(&query, &self);
         result.len()
     }
 }
 
-pub struct QueryGraph {
-    pub graph: Graph<QElement, QFlow>,
-    adjance_matrix: FixedBitSet,
+
+pub fn build_model(model: &Path, path: &Path) -> Result<Model, CompileError> {
+    let mut builder = ModelCompiler::new(vec![path.to_path_buf()]);
+
+    builder.compile_file(model)?;
+
+    let model = builder.build();
+
+    Ok(model)
 }
 
-pub struct QueryGraphBuilder {
-    graph: Graph<QElement, QFlow>,
-}
-impl QueryGraphBuilder {
-    pub fn new() -> Self {
-        Self {
-            graph: Graph::new(),
-        }
-    }
-    pub fn add(&mut self, e: QElement) -> NodeIndex {
-        self.graph.add_node(e)
-    }
-
-    pub fn connect(&mut self, a: NodeIndex, b: NodeIndex, flow: QFlow) -> EdgeIndex {
-        self.graph.add_edge(a, b, flow)
-    }
-    pub fn build(self) -> QueryGraph {
-        let matrix = self.graph.adjacency_matrix();
-        QueryGraph {
-            graph: self.graph,
-            adjance_matrix: matrix,
-        }
-    }
-}
-
-pub struct QElement(interpreter::Query);
-
-impl QElement {
-    fn new(query: &str) -> Result<Self, RunError> {
-        let query = parser::parse_query(query)?;
-        Ok(Self(query))
-    }
-}
-pub struct QFlow(interpreter::Query);
-impl QFlow {
-    pub fn new(query: &str) -> Result<Self, RunError> {
-        let query = parser::parse_query(query)?;
-        Ok(Self(query))
-    }
-}
 
 #[cfg(test)]
 mod test {
+    use self::threat::QueryGraph;
+
     use super::*;
 
     fn create_model() -> Model {
@@ -603,13 +596,13 @@ mod test {
         let ast = match ast {
             Ok(ast) => ast,
             Err(e) => {
-                dbg!(get_line_from_offset(source_code, e.offset()));
+                dbg!(parser::get_line_from_offset(source_code, e.offset()));
                 panic!();
             }
         };
         
         let mut model = ModelCompiler::new(vec![]);
-        model.compile(&ast).unwrap();
+        model.compile_ast(&ast).unwrap();
         model.build()
     }
 
@@ -620,67 +613,47 @@ mod test {
     #[test]
     fn test_query_model() {
         let model = create_model();
-
-        let mut query = QueryGraphBuilder::new();
-        let client = QElement::new(".bool").unwrap();
-        query.add(client);
-        let query = query.build();
-        assert_eq!(model.query(&query), 2);
+        let threat = QueryGraph::from_tql("c = Client(.bool)", &model.types).expect("perfect tql");
+        assert_eq!(model.query(&threat), 2);
     }
     #[test]
     fn test_not_query_model() {
         let model = create_model();
-
-        let mut query = QueryGraphBuilder::new();
-        query.add(QElement::new("not .bool").unwrap());
-        let query = query.build();
-        assert_eq!(model.query(&query), 0);
+        let threat = QueryGraph::from_tql("c = Client(not .bool)", &model.types).expect("perfect tql");
+        assert_eq!(model.query(&threat), 0);
     }
     #[test]
     fn test_none_member_query_model() {
         let model = create_model();
-
-        let mut query = QueryGraphBuilder::new();
-        query.add(QElement::new(".not_a_member").unwrap());
-        let query = query.build();
-        assert_eq!(model.query(&query), 0);
+        let threat = QueryGraph::from_tql("c = Client(.not_a_member)", &model.types).expect("perfect tql");
+        assert_eq!(model.query(&threat), 0);
     }
     #[test]
     fn test_or_query_model() {
         let model = create_model();
-
-        let mut query = QueryGraphBuilder::new();
-        query.add(QElement::new(" true == .client or .server").unwrap());
-        let query = query.build();
-        assert_eq!(model.query(&query), 2);
+        let threat = QueryGraph::from_tql("c = Client( true == .client or .server)", &model.types).expect("perfect tql");
+        assert_eq!(model.query(&threat), 2);
     }
     #[test]
     fn test_or_gt_query_model() {
         let model = create_model();
-
-        let mut query = QueryGraphBuilder::new();
-        query.add(QElement::new(" true >= .client or .server").unwrap());
-        let query = query.build();
-        assert_eq!(model.query(&query), 2);
+        let threat = QueryGraph::from_tql("c = Client( true >= .client or .server)", &model.types).expect("perfect tql");
+        assert_eq!(model.query(&threat), 2);
     }
     #[test]
     fn test_true_query_model() {
         let model = create_model();
-        let mut query = QueryGraphBuilder::new();
-        query.add(QElement::new("true").unwrap());
-        let query = query.build();
-        assert_eq!(model.query(&query), 3);
+        let threat = QueryGraph::from_tql("c = Client( true )", &model.types).expect("perfect tql");
+        assert_eq!(model.query(&threat), 3);
     }
     #[test]
     fn test_flow() {
         let model = create_model();
-
-        let mut query = QueryGraphBuilder::new();
-        let client = query.add(QElement::new(".client and true == .bool").unwrap());
-        let server = query.add(QElement::new(".server").unwrap());
-        let _request_login = query.connect(client, server, QFlow::new("true").unwrap());
-
-        let query = query.build();
-        assert_eq!(model.query(&query), 1);
+        let threat = QueryGraph::from_tql("
+            c = Client( .client and true == .bool )
+            s = Server( .server)
+            c -> s = Flow(true)
+            ", &model.types).expect("perfect tql");
+        assert_eq!(model.query(&threat), 1);
     }
 }

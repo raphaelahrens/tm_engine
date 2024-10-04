@@ -1,18 +1,35 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Display;
 
 use std::rc::Rc;
+
+use std::hash::{Hash, Hasher};
 
 use thiserror::Error;
 
 use crate::{Str, Value};
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct UnionType(Vec<Type>);
+/**
+ * A [UnionType] describes all the types a varaible or member can be.
+ *
+ */
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnionType(HashSet<Type>);
+impl Hash for UnionType {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for t in self.0.iter() {
+            t.hash(state)
+        }
+    }
+}
 
 impl UnionType {
-    pub fn new(datatypes:Vec<Type>) -> Self {
-        UnionType(datatypes)
+    pub fn from_vec(datatypes:Vec<Type>) -> Self {
+        let mut type_set = HashSet::new();
+        for t in datatypes{
+            type_set.insert(t);
+        }
+        UnionType(type_set)
     }
     pub fn contains(&self, datatype:&Type) -> bool {
         self.0.contains(datatype)
@@ -22,11 +39,10 @@ impl UnionType {
 impl Display for UnionType {
 
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let last = self.0.len()- 1;
-        for t in &self.0[..last] {
+        for t in self.0.iter() {
             write!(f, "{} | ", t)?;
         }
-        write!(f, "{}", self.0[last])
+        Ok(())
     }
 }
 
@@ -36,6 +52,10 @@ impl From<&UnionType> for String {
     }
 }
 
+/**
+ * A type member holds the type ([TypeMember::datatype]) and the optional default value of that
+ * member.
+ */
 #[derive(Debug, Clone)]
 struct TypeMember {
     pub datatype: UnionType,
@@ -47,6 +67,14 @@ impl PartialEq for TypeMember {
         self.datatype == other.datatype
     }
 }
+
+impl Hash for TypeMember {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.datatype.hash(state);
+    }
+}
+
+impl Eq for TypeMember {}
 
 #[derive(Error, Debug, PartialEq)]
 pub enum TypeError {
@@ -60,12 +88,14 @@ pub enum TypeError {
     NotAnEnumType(String),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/**
+ * [Type] is an enum of all base types (Bool, Int, String) , classes, enum and lists.
+ */
+#[derive(Debug, Clone, PartialEq, Hash, Eq)]
 pub enum Type {
     Bool,
     Int,
     Str,
-    Object,
     Class(ClassRef),
     Enum(EnumRef),
     List(UnionType),
@@ -77,23 +107,15 @@ impl Display for Type {
             Self::Bool => "Bool",
             Self::Int => "Int",
             Self::Str => "String",
-            Self::Object => "Object",
             Self::Class(cls_ref) => {
-                return write!(f, "{}", cls_ref);
+                return write!(f, "{cls_ref}");
             },
             Self::Enum(enum_ref) =>{
-                return write!(f, "Enum {}", enum_ref);
+                return write!(f, "Enum {enum_ref}");
             },
             Self::List(inner_type) => {
-                return write!(f, "[{}]", inner_type);
+                return write!(f, "[{inner_type}]");
             },
-            //Self::Union(types) => {
-            //    let last = dbg!(types.len())- 1;
-            //    for t in &types[..last] {
-            //        write!(f, "{} | ", t)?;
-            //    }
-            //    return write!(f, "{}", types[last]);
-            //},
         };
         write!(f, "{}", s)
     }
@@ -101,13 +123,20 @@ impl Display for Type {
 
 impl From<&Type> for String {
     fn from(item: &Type) -> Self {
-        format!("{}", item)
+        format!("{item}")
     }
 }
 
+/**
+ * The [TypeTable] is constructed while parsing the model and the threats.
+ *
+ * It holds all custom classes and enums, and assigns a [TypeRef] to the name of the type.
+ *
+ * With the name the [TypeRef] can be retrieved.
+ */
 #[derive(Debug)]
 pub struct TypeTable {
-    map: BTreeMap<Str, TypeDef>,
+    map: BTreeMap<Str, TypeRef>,
 }
 
 impl TypeTable {
@@ -116,16 +145,16 @@ impl TypeTable {
             map: BTreeMap::new(),
         }
     }
-    fn get(&self, name: &str) -> Option<&TypeDef> {
+    fn get(&self, name: &str) -> Option<&TypeRef> {
         self.map.get(name)
     }
     pub fn add_class(&mut self, name: &str, datatype: Class) -> Result<(), TypeError> {
-        self.add_type(name, TypeDef::Class(Rc::new(datatype)))
+        self.add_type(name, TypeRef::Class(Rc::new(datatype)))
     }
     pub fn add_enum(&mut self, name: &str, datatype: Enum) -> Result<(), TypeError> {
-        self.add_type(name, TypeDef::Enum(Rc::new(datatype)))
+        self.add_type(name, TypeRef::Enum(Rc::new(datatype)))
     }
-    fn add_type(&mut self, name: &str, datatype: TypeDef) -> Result<(), TypeError> {
+    fn add_type(&mut self, name: &str, datatype: TypeRef) -> Result<(), TypeError> {
         if let Some(_) = self.map.insert(name.into(), datatype.clone()) {
             return Err(TypeError::RedefinedType(name.to_string()));
         }
@@ -134,22 +163,22 @@ impl TypeTable {
 
     pub fn get_class(&self, name: &str) -> Result<&ClassRef, TypeError> {
         match self.get(name).ok_or(TypeError::UndeclaredType(name.to_string()))? {
-            TypeDef::Class(class_ref) => Ok(class_ref),
-            TypeDef::Enum(_) => Err(TypeError::NotAClassType(name.to_string())),
+            TypeRef::Class(class_ref) => Ok(class_ref),
+            TypeRef::Enum(_) => Err(TypeError::NotAClassType(name.to_string())),
         }
     }
     pub fn get_enum(&self, name: &str) -> Result<&EnumRef, TypeError> {
         match self.get(name).ok_or(TypeError::UndeclaredType(name.to_string()))? {
-            TypeDef::Class(_) => Err(TypeError::NotAnEnumType(name.to_string())),
-            TypeDef::Enum(enum_ref)=> Ok(enum_ref),
+            TypeRef::Class(_) => Err(TypeError::NotAnEnumType(name.to_string())),
+            TypeRef::Enum(enum_ref)=> Ok(enum_ref),
         }
     }
     pub fn get_type(&self, name: &str) -> Result<Type, TypeError> {
         match self.get(name).ok_or(TypeError::UndeclaredType(name.to_string()))?{
-            TypeDef::Class(class_ref) => {
+            TypeRef::Class(class_ref) => {
                 Ok(Type::Class(class_ref.clone()))
             },
-            TypeDef::Enum(enum_ref) => {
+            TypeRef::Enum(enum_ref) => {
                 Ok(Type::Enum(enum_ref.clone()))
             },
 
@@ -160,12 +189,19 @@ impl TypeTable {
 pub type ClassRef = Rc<Class>;
 pub type EnumRef = Rc<Enum>;
 
+/**
+ * A reference to either a [Class] type ([ClassRef]) or an [Enum] type ([EnumRef]).
+ */
 #[derive(Debug, Clone, PartialEq)]
-enum TypeDef {
+enum TypeRef {
     Class(ClassRef),
     Enum(EnumRef),
 }
-#[derive(Debug, PartialEq)]
+
+/**
+ * description of an enum type and it variants.
+ */
+#[derive(Debug, PartialEq, Hash, Eq)]
 pub struct Enum {
     name: Str,
     pub variants: BTreeSet<Str>,
@@ -222,7 +258,11 @@ pub enum ClassError {
     UnknownMember(MemberInfo),
 }
 
-#[derive(Debug, PartialEq)]
+/**
+ * Description of a class type, including the name nof the class and the member names and their
+ * type ([TypeMember])
+ */
+#[derive(Debug, PartialEq, Hash, Eq)]
 pub struct Class {
     name: Str,
     members: BTreeMap<Str, TypeMember>,
@@ -262,7 +302,7 @@ impl Class {
         self.add(
             name,
             TypeMember {
-                datatype: UnionType::new(vec![default.get_type()]),
+                datatype: UnionType::from_vec(vec![default.get_type()]),
                 default: Some(default),
             },
         )
